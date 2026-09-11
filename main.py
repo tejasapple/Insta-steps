@@ -53,7 +53,7 @@ async def init_db() -> None:
     """Initialize the async SQLite database and required tables."""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            # Table for Users (Added is_banned column)
+            # Table for Users
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -65,13 +65,13 @@ async def init_db() -> None:
                 )
             """)
             
-            # Safe migration for existing databases to add is_banned column if missing
+            # Safe migration for existing databases
             try:
                 await db.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
             except Exception:
-                pass # Column already exists
+                pass 
             
-            # Table for Admin Settings
+            # Legacy Table for single Settings (like Start msg, DP channel, Dump channel)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -80,6 +80,19 @@ async def init_db() -> None:
                     media_type TEXT
                 )
             """)
+            
+            # NEW Table for Multi-message Step configuration
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS step_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    step_name TEXT,
+                    msg_type TEXT,
+                    media_id TEXT,
+                    text_val TEXT,
+                    order_index INTEGER
+                )
+            """)
+            
             # DP Bank Table
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS dp_bank (
@@ -135,21 +148,19 @@ async def is_user_banned(user_id: int) -> bool:
 # ----------------- ADMIN STATES & HANDLERS ----------------- #
 class AdminState(StatesGroup):
     waiting_for_start_msg = State()
-    waiting_for_step1 = State()
-    waiting_for_step2 = State()
-    waiting_for_step3 = State()
-    waiting_for_step4 = State()
     waiting_for_dp_channel = State()
     waiting_for_dump_channel = State()
     waiting_for_broadcast = State()
+    # New Multi-message setup states
+    waiting_for_step_content = State()
 
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Set Start Msg", callback_data="admin_set_start")],
-        [InlineKeyboardButton(text="Set Step 1", callback_data="admin_set_step1"),
-         InlineKeyboardButton(text="Set Step 2", callback_data="admin_set_step2")],
-        [InlineKeyboardButton(text="Set Step 3", callback_data="admin_set_step3"),
-         InlineKeyboardButton(text="Set Step 4", callback_data="admin_set_step4")],
+        [InlineKeyboardButton(text="Set Step 1", callback_data="admin_edit_step1"),
+         InlineKeyboardButton(text="Set Step 2", callback_data="admin_edit_step2")],
+        [InlineKeyboardButton(text="Set Step 3", callback_data="admin_edit_step3"),
+         InlineKeyboardButton(text="Set Step 4", callback_data="admin_edit_step4")],
         [InlineKeyboardButton(text="Set DP Channel ID", callback_data="admin_set_dp_channel"),
          InlineKeyboardButton(text="Set Dump Channel ID", callback_data="admin_set_dump_channel")],
         [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast"),
@@ -157,7 +168,15 @@ def admin_keyboard() -> InlineKeyboardMarkup:
     ])
 
 @admin_router.message(Command("admin"), F.from_user.id == ADMIN_ID)
-async def admin_panel(message: Message, state: FSMContext) -> None:
+async def admin_panel_cmd(message: Message, state: FSMContext) -> None:
+    await send_admin_panel(message.chat.id, state)
+
+@admin_router.callback_query(F.data == "admin_panel_open", F.from_user.id == ADMIN_ID)
+async def admin_panel_callback(call: CallbackQuery, state: FSMContext) -> None:
+    await send_admin_panel(call.message.chat.id, state)
+    await call.answer()
+
+async def send_admin_panel(chat_id: int, state: FSMContext) -> None:
     try:
         await state.clear()
         help_text = (
@@ -167,7 +186,7 @@ async def admin_panel(message: Message, state: FSMContext) -> None:
             "To ban a user: <code>/ban user_id</code>\n"
             "To unban a user: <code>/unban user_id</code>"
         )
-        await message.answer(help_text, reply_markup=admin_keyboard())
+        await bot.send_message(chat_id, help_text, reply_markup=admin_keyboard())
     except TelegramAPIError as e:
         logger.error(f"Admin panel error: {e}")
 
@@ -252,29 +271,142 @@ async def execute_broadcast(message: Message, state: FSMContext) -> None:
                 success += 1
             except Exception:
                 failed += 1
-            # Prevent Telegram API FloodWait error
             await asyncio.sleep(0.1)
             
         report = (
             "✅ <b>Broadcast Completed!</b>\n\n"
             f"📨 Successfully sent to: {success} users\n"
-            f"❌ Failed (Blocked bot/Didn't reply): {failed} users"
+            f"❌ Failed: {failed} users"
         )
         await processing_msg.edit_text(report)
     except Exception as e:
         logger.error(f"Broadcast execution error: {e}")
         await message.answer("❌ Error occurred during broadcast.")
 
+# ----------------- ADMIN MULTI-MESSAGE STEP SETUP ----------------- #
+@admin_router.callback_query(F.data.startswith("admin_edit_step"), F.from_user.id == ADMIN_ID)
+async def admin_edit_step(call: CallbackQuery, state: FSMContext) -> None:
+    try:
+        step_name = call.data.replace("admin_edit_", "")
+        await state.update_data(current_step=step_name)
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT msg_type, text_val FROM step_messages WHERE step_name = ? ORDER BY order_index ASC", (step_name,)) as cursor:
+                messages = await cursor.fetchall()
+        
+        parts_text = f"🛠 <b>Editing {step_name.upper()}</b>\n\nCurrent Assigned Messages:\n"
+        if not messages:
+            parts_text += "<i>No messages configured yet.</i>\n"
+        else:
+            for i, (m_type, txt) in enumerate(messages, 1):
+                preview = txt[:25] + "..." if txt and len(txt) > 25 else (txt or "No Caption/Text")
+                parts_text += f"{i}. <b>[{m_type.upper()}]</b> - {preview}\n"
+                
+        parts_text += "\n<i>What do you want to add next? The bot will send them in order (1, 2, 3...).</i>"
+        
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Set Text", callback_data="add_part_text"),
+             InlineKeyboardButton(text="➕ Set Photo", callback_data="add_part_photo")],
+            [InlineKeyboardButton(text="➕ Set Video", callback_data="add_part_video"),
+             InlineKeyboardButton(text="➕ Set Voice", callback_data="add_part_voice")],
+            [InlineKeyboardButton(text="🗑 Clear All in this Step", callback_data="clear_step_parts")],
+            [InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel_open")]
+        ])
+        
+        await call.message.edit_text(parts_text, reply_markup=keyboard)
+        await call.answer()
+    except Exception as e:
+        logger.error(f"Admin edit step error: {e}")
+
+@admin_router.callback_query(F.data.startswith("add_part_"), F.from_user.id == ADMIN_ID)
+async def add_part_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    try:
+        msg_type = call.data.replace("add_part_", "")
+        data = await state.get_data()
+        step_name = data.get("current_step", "Unknown Step")
+        
+        await state.update_data(expected_type=msg_type)
+        await state.set_state(AdminState.waiting_for_step_content)
+        
+        await call.message.edit_text(f"📤 Please send the <b>{msg_type.upper()}</b> for {step_name.upper()}.\n\n<i>Note: You can add captions if sending media.</i>")
+        await call.answer()
+    except Exception as e:
+        logger.error(f"Add part prompt error: {e}")
+
+@admin_router.message(AdminState.waiting_for_step_content, F.from_user.id == ADMIN_ID)
+async def save_step_part(message: Message, state: FSMContext) -> None:
+    try:
+        data = await state.get_data()
+        step_name = data.get("current_step")
+        expected_type = data.get("expected_type")
+        
+        if not step_name:
+            await message.answer("❌ Session expired. Please open admin panel again.")
+            await state.clear()
+            return
+            
+        text_val = message.html_text or ""
+        media_id = None
+        msg_type = 'text'
+        
+        if expected_type == 'photo' and message.photo:
+            media_id = message.photo[-1].file_id
+            msg_type = 'photo'
+        elif expected_type == 'video' and message.video:
+            media_id = message.video.file_id
+            msg_type = 'video'
+        elif expected_type == 'voice' and message.voice:
+            media_id = message.voice.file_id
+            msg_type = 'voice'
+        elif expected_type == 'text' and message.text:
+            msg_type = 'text'
+        else:
+            await message.answer(f"⚠️ Invalid format! I am expecting a <b>{expected_type.upper()}</b>. Please try again.")
+            return
+            
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT MAX(order_index) FROM step_messages WHERE step_name = ?", (step_name,)) as cursor:
+                res = await cursor.fetchone()
+                order_index = (res[0] or 0) + 1
+            await db.execute("INSERT INTO step_messages (step_name, msg_type, media_id, text_val, order_index) VALUES (?, ?, ?, ?, ?)",
+                             (step_name, msg_type, media_id, text_val, order_index))
+            await db.commit()
+            
+        success_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=f"🔙 Go Back to {step_name.upper()}", callback_data=f"admin_edit_{step_name}")]
+        ])
+        await message.answer(f"✅ Successfully added <b>{msg_type.upper()}</b> as Part {order_index} in {step_name.upper()}!", reply_markup=success_keyboard)
+        await state.set_state(None) # Clear state but keep data for easy back navigation
+    except Exception as e:
+        logger.error(f"Error saving step part: {e}")
+
+@admin_router.callback_query(F.data == "clear_step_parts", F.from_user.id == ADMIN_ID)
+async def clear_step_parts(call: CallbackQuery, state: FSMContext) -> None:
+    try:
+        data = await state.get_data()
+        step_name = data.get("current_step")
+        if step_name:
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("DELETE FROM step_messages WHERE step_name = ?", (step_name,))
+                await db.commit()
+            
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=f"🔙 Go Back to {step_name.upper()}", callback_data=f"admin_edit_{step_name}")]
+            ])
+            await call.message.edit_text(f"🗑 All messages for <b>{step_name.upper()}</b> have been cleared!", reply_markup=keyboard)
+            await call.answer()
+        else:
+            await call.answer("❌ Error: Step not found.", show_alert=True)
+    except Exception as e:
+        logger.error(f"Error clearing step parts: {e}")
+
+# Admin Single Settings (Start Msg, Channels)
 @admin_router.callback_query(F.data.startswith("admin_set_"), F.from_user.id == ADMIN_ID)
-async def admin_setup_callbacks(call: CallbackQuery, state: FSMContext) -> None:
+async def admin_setup_single_callbacks(call: CallbackQuery, state: FSMContext) -> None:
     try:
         action = call.data.replace("admin_set_", "")
         prompts = {
-            "start": ("waiting_for_start_msg", "Send the new START message (Text/Photo/Video/Voice).\n(Hint: Mention your Instagram Work/Reels providing business here)"),
-            "step1": ("waiting_for_step1", "Send the new STEP 1 message (Text/Photo/Video/Voice)."),
-            "step2": ("waiting_for_step2", "Send the new STEP 2 message (Text/Photo/Video/Voice)."),
-            "step3": ("waiting_for_step3", "Send the new STEP 3 message (Text/Photo/Video/Voice)."),
-            "step4": ("waiting_for_step4", "Send the new STEP 4 message (Text/Photo/Video/Voice)."),
+            "start": ("waiting_for_start_msg", "Send the new START message (Text/Photo/Video/Voice)."),
             "dp_channel": ("waiting_for_dp_channel", "Send the Channel ID for DP Bank (e.g. -100123456789). Bot must be admin there."),
             "dump_channel": ("waiting_for_dump_channel", "Send the Channel ID for Video Dump (e.g. -100123456789). Bot must be admin there.")
         }
@@ -304,7 +436,10 @@ async def save_media_setting(message: Message, state: FSMContext, key_name: str)
             media_type = 'voice'
 
         await set_setting(key_name, text_val, media_id, media_type)
-        await message.answer(f"✅ Successfully saved {key_name.replace('_', ' ').title()}!")
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel_open")]
+        ])
+        await message.answer(f"✅ Successfully saved {key_name.replace('_', ' ').title()}!", reply_markup=keyboard)
         await state.clear()
     except Exception as e:
         logger.error(f"Error saving media setting: {e}")
@@ -313,23 +448,12 @@ async def save_media_setting(message: Message, state: FSMContext, key_name: str)
 @admin_router.message(AdminState.waiting_for_start_msg, F.from_user.id == ADMIN_ID)
 async def save_start(msg: Message, state: FSMContext) -> None: await save_media_setting(msg, state, "start_msg")
 
-@admin_router.message(AdminState.waiting_for_step1, F.from_user.id == ADMIN_ID)
-async def save_step1(msg: Message, state: FSMContext) -> None: await save_media_setting(msg, state, "step1_msg")
-
-@admin_router.message(AdminState.waiting_for_step2, F.from_user.id == ADMIN_ID)
-async def save_step2(msg: Message, state: FSMContext) -> None: await save_media_setting(msg, state, "step2_msg")
-
-@admin_router.message(AdminState.waiting_for_step3, F.from_user.id == ADMIN_ID)
-async def save_step3(msg: Message, state: FSMContext) -> None: await save_media_setting(msg, state, "step3_msg")
-
-@admin_router.message(AdminState.waiting_for_step4, F.from_user.id == ADMIN_ID)
-async def save_step4(msg: Message, state: FSMContext) -> None: await save_media_setting(msg, state, "step4_msg")
-
 @admin_router.message(AdminState.waiting_for_dp_channel, F.from_user.id == ADMIN_ID)
 async def save_dp_channel(message: Message, state: FSMContext) -> None:
     try:
         await set_setting("dp_channel", message.text.strip())
-        await message.answer("✅ DP Channel ID saved! Bot will now auto-save any photos posted there.")
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel_open")]])
+        await message.answer("✅ DP Channel ID saved! Bot will now auto-save any photos posted there.", reply_markup=keyboard)
         await state.clear()
     except Exception as e:
         logger.error(f"Error saving DP channel: {e}")
@@ -338,7 +462,8 @@ async def save_dp_channel(message: Message, state: FSMContext) -> None:
 async def save_dump_channel(message: Message, state: FSMContext) -> None:
     try:
         await set_setting("dump_channel", message.text.strip())
-        await message.answer("✅ Video Dump Channel ID saved! Bot will now auto-save any videos posted there.")
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel_open")]])
+        await message.answer("✅ Video Dump Channel ID saved! Bot will now auto-save any videos posted there.", reply_markup=keyboard)
         await state.clear()
     except Exception as e:
         logger.error(f"Error saving Dump channel: {e}")
@@ -370,40 +495,48 @@ async def listen_channels(message: Message) -> None:
         logger.error(f"Error in channel listener: {e}")
 
 # ----------------- USER HANDLERS ----------------- #
-def main_steps_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Step 1", callback_data="run_step1")],
-        [InlineKeyboardButton(text="Step 2", callback_data="run_step2")],
-        [InlineKeyboardButton(text="Step 3", callback_data="run_step3")],
-        [InlineKeyboardButton(text="Step 4", callback_data="run_step4")]
-    ])
+def main_steps_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="1️⃣ Step 1", callback_data="run_step1")],
+        [InlineKeyboardButton(text="2️⃣ Step 2", callback_data="run_step2")],
+        [InlineKeyboardButton(text="3️⃣ Step 3", callback_data="run_step3")],
+        [InlineKeyboardButton(text="4️⃣ Step 4", callback_data="run_step4")]
+    ]
+    if is_admin:
+        buttons.append([InlineKeyboardButton(text="🛠 Admin Panel", callback_data="admin_panel_open")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-async def send_custom_content(chat_id: int, key: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
-    content = await get_setting(key)
-    if not content:
-        default_msgs = {
-            "start_msg": "Welcome! Please check Admin Panel and setup this message.",
-            "step1_msg": "Admin hasn't set Step 1 yet.",
-            "step2_msg": "Admin hasn't set Step 2 yet.",
-            "step3_msg": "Admin hasn't set Step 3 yet.",
-            "step4_msg": "Admin hasn't set Step 4 yet."
-        }
-        fallback_text = default_msgs.get(key, "Admin hasn't set this content yet.")
-        await bot.send_message(chat_id, fallback_text, reply_markup=reply_markup)
-        return
-
-    text_val, media_id, media_type = content
+async def send_custom_step_content(chat_id: int, step_name: str, final_markup: Optional[InlineKeyboardMarkup] = None) -> None:
     try:
-        if media_type == 'photo':
-            await bot.send_photo(chat_id, photo=media_id, caption=text_val, reply_markup=reply_markup)
-        elif media_type == 'video':
-            await bot.send_video(chat_id, video=media_id, caption=text_val, reply_markup=reply_markup)
-        elif media_type == 'voice':
-            await bot.send_voice(chat_id, voice=media_id, caption=text_val, reply_markup=reply_markup)
-        else:
-            await bot.send_message(chat_id, text=text_val, reply_markup=reply_markup)
-    except TelegramAPIError as e:
-        logger.error(f"Failed to send custom content for {key}: {e}")
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT msg_type, media_id, text_val FROM step_messages WHERE step_name = ? ORDER BY order_index ASC", (step_name,)) as cursor:
+                messages = await cursor.fetchall()
+        
+        if not messages:
+            await bot.send_message(chat_id, f"⚠️ Admin hasn't set any messages for {step_name.title()} yet.", reply_markup=final_markup)
+            return
+
+        for i, (msg_type, media_id, text_val) in enumerate(messages):
+            # Only attach the inline keyboard to the LAST message of the step
+            markup = final_markup if i == len(messages) - 1 else None
+            
+            try:
+                if msg_type == 'photo':
+                    await bot.send_photo(chat_id, photo=media_id, caption=text_val, reply_markup=markup)
+                elif msg_type == 'video':
+                    await bot.send_video(chat_id, video=media_id, caption=text_val, reply_markup=markup)
+                elif msg_type == 'voice':
+                    await bot.send_voice(chat_id, voice=media_id, caption=text_val, reply_markup=markup)
+                else:
+                    await bot.send_message(chat_id, text=text_val, reply_markup=markup)
+            except TelegramAPIError as e:
+                logger.error(f"Failed to send part of {step_name}: {e}")
+            
+            # Anti-flood delay between sending multiple parts
+            await asyncio.sleep(0.3)
+            
+    except Exception as e:
+        logger.error(f"Error sending step content: {e}")
 
 @user_router.message(CommandStart())
 async def start_cmd(message: Message) -> None:
@@ -412,7 +545,25 @@ async def start_cmd(message: Message) -> None:
             return
             
         await register_user(message.from_user.id, message.from_user.username)
-        await send_custom_content(message.chat.id, "start_msg", reply_markup=main_steps_keyboard())
+        
+        content = await get_setting("start_msg")
+        is_admin = (message.from_user.id == ADMIN_ID)
+        keyboard = main_steps_keyboard(is_admin)
+        
+        if not content:
+            await message.answer("Welcome! Please check Admin Panel and setup the start message.", reply_markup=keyboard)
+            return
+
+        text_val, media_id, media_type = content
+        if media_type == 'photo':
+            await message.answer_photo(photo=media_id, caption=text_val, reply_markup=keyboard)
+        elif media_type == 'video':
+            await message.answer_video(video=media_id, caption=text_val, reply_markup=keyboard)
+        elif media_type == 'voice':
+            await message.answer_voice(voice=media_id, caption=text_val, reply_markup=keyboard)
+        else:
+            await message.answer(text=text_val, reply_markup=keyboard)
+            
     except Exception as e:
         logger.error(f"Start command error: {e}")
 
@@ -423,7 +574,7 @@ async def process_step1(call: CallbackQuery) -> None:
             await call.answer("🚫 You are banned from using this bot.", show_alert=True)
             return
             
-        await send_custom_content(call.message.chat.id, "step1_msg")
+        await send_custom_step_content(call.message.chat.id, "step1")
         await call.answer()
     except Exception as e:
         logger.error(f"Step 1 error: {e}")
@@ -443,14 +594,12 @@ async def process_step2(call: CallbackQuery) -> None:
         if len(dps) > 0:
             media_group = [InputMediaPhoto(media=dp[0]) for dp in dps]
             await bot.send_media_group(call.message.chat.id, media=media_group)
-        else:
-            pass # Keep it clean if no DP exists, just send the instructions below
-
-        # Send Step 2 main message with Unlock button for Step 3
+        
+        # Send Multi-message Step 2 content with Unlock button for Step 3 at the very end
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="I have done this step", callback_data="req_unlock_3")]
         ])
-        await send_custom_content(call.message.chat.id, "step2_msg", reply_markup=keyboard)
+        await send_custom_step_content(call.message.chat.id, "step2", final_markup=keyboard)
         await call.answer()
     except Exception as e:
         logger.error(f"Step 2 error: {e}")
@@ -492,30 +641,32 @@ async def process_step3(call: CallbackQuery) -> None:
             return
 
         batch_counter = user_data[2]
-        batch_size = 6
-        offset = batch_counter * batch_size
-
-        # Fetch videos for this batch
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT file_id FROM video_dump ORDER BY id ASC LIMIT ? OFFSET ?", (batch_size, offset)) as cursor:
-                videos = await cursor.fetchall()
-
-        if not videos:
-            await call.message.answer("📭 No more videos available in the batch at the moment.")
+        
+        # User only gets 2 batches of 6 videos. Total 12 max.
+        if batch_counter >= 2:
+            await call.message.answer("📭 You have already received all the video batches available.")
         else:
-            media_group = [InputMediaVideo(media=vid[0]) for vid in videos]
-            await bot.send_media_group(call.message.chat.id, media=media_group)
-            
-            # Increment batch
+            # Fetch 6 Random videos for this batch
             async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("UPDATE users SET video_batch = video_batch + 1 WHERE user_id = ?", (call.from_user.id,))
-                await db.commit()
+                async with db.execute("SELECT file_id FROM video_dump ORDER BY RANDOM() LIMIT 6") as cursor:
+                    videos = await cursor.fetchall()
 
-        # Send Step 3 custom content with Unlock Step 4 button
+            if not videos:
+                await call.message.answer("📭 No more videos available in the bank right now.")
+            else:
+                media_group = [InputMediaVideo(media=vid[0]) for vid in videos]
+                await bot.send_media_group(call.message.chat.id, media=media_group)
+                
+                # Increment batch counter
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("UPDATE users SET video_batch = video_batch + 1 WHERE user_id = ?", (call.from_user.id,))
+                    await db.commit()
+
+        # Send Multi-message Step 3 content with Unlock Step 4 button at the very end
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="I have done this step", callback_data="req_unlock_4")]
         ])
-        await send_custom_content(call.message.chat.id, "step3_msg", reply_markup=keyboard)
+        await send_custom_step_content(call.message.chat.id, "step3", final_markup=keyboard)
         await call.answer()
     except Exception as e:
         logger.error(f"Step 3 error: {e}")
@@ -556,7 +707,7 @@ async def process_step4(call: CallbackQuery) -> None:
             await call.answer("❌ Access Denied. Contact Admin.", show_alert=True)
             return
 
-        await send_custom_content(call.message.chat.id, "step4_msg")
+        await send_custom_step_content(call.message.chat.id, "step4")
         await call.answer()
     except Exception as e:
         logger.error(f"Step 4 error: {e}")
@@ -580,7 +731,6 @@ async def admin_approve_request(call: CallbackQuery) -> None:
 
         await call.message.edit_text(f"{call.message.html_text}\n\n✅ <b>Approved Successfully</b>")
         
-        # Notify the user
         try:
             await bot.send_message(target_user_id, msg_to_user)
         except TelegramAPIError:
@@ -599,7 +749,6 @@ async def admin_deny_request(call: CallbackQuery) -> None:
 
         await call.message.edit_text(f"{call.message.html_text}\n\n❌ <b>Denied by Admin</b>")
         
-        # Notify the user
         try:
             await bot.send_message(target_user_id, f"❌ Your request to unlock Step {step} was denied by the Admin. Please check your tasks again.")
         except TelegramAPIError:
