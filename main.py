@@ -53,16 +53,24 @@ async def init_db() -> None:
     """Initialize the async SQLite database and required tables."""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
-            # Table for Users
+            # Table for Users (Added is_banned column)
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
                     username TEXT,
                     step3_unlocked INTEGER DEFAULT 0,
                     step4_unlocked INTEGER DEFAULT 0,
-                    video_batch INTEGER DEFAULT 0
+                    video_batch INTEGER DEFAULT 0,
+                    is_banned INTEGER DEFAULT 0
                 )
             """)
+            
+            # Safe migration for existing databases to add is_banned column if missing
+            try:
+                await db.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
+            except Exception:
+                pass # Column already exists
+            
             # Table for Admin Settings
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
@@ -109,14 +117,20 @@ async def get_setting(key: str) -> Optional[Tuple[str, Optional[str], Optional[s
 
 async def register_user(user_id: int, username: Optional[str]) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO users (user_id, username) VALUES (?, ?)", (user_id, username))
+        await db.execute("INSERT OR IGNORE INTO users (user_id, username, is_banned) VALUES (?, ?, 0)", (user_id, username))
         await db.execute("UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
         await db.commit()
 
-async def get_user(user_id: int) -> Optional[Tuple[int, int, int]]:
+async def get_user(user_id: int) -> Optional[Tuple[int, int, int, int]]:
     async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT step3_unlocked, step4_unlocked, video_batch FROM users WHERE user_id = ?", (user_id,)) as cursor:
+        async with db.execute("SELECT step3_unlocked, step4_unlocked, video_batch, is_banned FROM users WHERE user_id = ?", (user_id,)) as cursor:
             return await cursor.fetchone()
+
+async def is_user_banned(user_id: int) -> bool:
+    user_data = await get_user(user_id)
+    if user_data and len(user_data) >= 4 and user_data[3] == 1:
+        return True
+    return False
 
 # ----------------- ADMIN STATES & HANDLERS ----------------- #
 class AdminState(StatesGroup):
@@ -127,6 +141,7 @@ class AdminState(StatesGroup):
     waiting_for_step4 = State()
     waiting_for_dp_channel = State()
     waiting_for_dump_channel = State()
+    waiting_for_broadcast = State()
 
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -136,23 +151,126 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Set Step 3", callback_data="admin_set_step3"),
          InlineKeyboardButton(text="Set Step 4", callback_data="admin_set_step4")],
         [InlineKeyboardButton(text="Set DP Channel ID", callback_data="admin_set_dp_channel"),
-         InlineKeyboardButton(text="Set Dump Channel ID", callback_data="admin_set_dump_channel")]
+         InlineKeyboardButton(text="Set Dump Channel ID", callback_data="admin_set_dump_channel")],
+        [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast"),
+         InlineKeyboardButton(text="📊 Stats", callback_data="admin_stats")]
     ])
 
 @admin_router.message(Command("admin"), F.from_user.id == ADMIN_ID)
 async def admin_panel(message: Message, state: FSMContext) -> None:
     try:
         await state.clear()
-        await message.answer("🛠 <b>Admin Panel</b>\nSelect what you want to customize:", reply_markup=admin_keyboard())
+        help_text = (
+            "🛠 <b>Admin Panel</b>\n"
+            "Select what you want to customize below.\n\n"
+            "<b>Ban/Unban Commands:</b>\n"
+            "To ban a user: <code>/ban user_id</code>\n"
+            "To unban a user: <code>/unban user_id</code>"
+        )
+        await message.answer(help_text, reply_markup=admin_keyboard())
     except TelegramAPIError as e:
         logger.error(f"Admin panel error: {e}")
+
+@admin_router.message(Command("ban"), F.from_user.id == ADMIN_ID)
+async def ban_user_cmd(message: Message) -> None:
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await message.answer("⚠️ Usage: <code>/ban user_id</code>")
+            return
+        target_id = int(args[1])
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (target_id,))
+            await db.commit()
+        await message.answer(f"✅ User {target_id} has been permanently banned from using the bot.")
+    except Exception as e:
+        logger.error(f"Ban error: {e}")
+        await message.answer("❌ Invalid User ID or Error occurred.")
+
+@admin_router.message(Command("unban"), F.from_user.id == ADMIN_ID)
+async def unban_user_cmd(message: Message) -> None:
+    try:
+        args = message.text.split()
+        if len(args) != 2:
+            await message.answer("⚠️ Usage: <code>/unban user_id</code>")
+            return
+        target_id = int(args[1])
+        async with aiosqlite.connect(DB_PATH) as db:
+            await db.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (target_id,))
+            await db.commit()
+        await message.answer(f"✅ User {target_id} has been unbanned successfully.")
+    except Exception as e:
+        logger.error(f"Unban error: {e}")
+        await message.answer("❌ Invalid User ID or Error occurred.")
+
+@admin_router.callback_query(F.data == "admin_stats", F.from_user.id == ADMIN_ID)
+async def show_stats(call: CallbackQuery) -> None:
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT COUNT(*) FROM users") as cursor:
+                total_users = (await cursor.fetchone())[0]
+            async with db.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1") as cursor:
+                banned_users = (await cursor.fetchone())[0]
+        
+        stats_text = (
+            "📊 <b>Bot Statistics</b>\n\n"
+            f"👥 Total Users: {total_users}\n"
+            f"✅ Active Users: {total_users - banned_users}\n"
+            f"🚫 Banned Users: {banned_users}\n\n"
+            "<i>Note: Real-time blocked/inactive users are calculated after a broadcast.</i>"
+        )
+        await call.message.answer(stats_text)
+        await call.answer()
+    except Exception as e:
+        logger.error(f"Stats error: {e}")
+
+@admin_router.callback_query(F.data == "admin_broadcast", F.from_user.id == ADMIN_ID)
+async def setup_broadcast(call: CallbackQuery, state: FSMContext) -> None:
+    try:
+        await state.set_state(AdminState.waiting_for_broadcast)
+        await call.message.answer("📢 Please send the message (Text/Photo/Video/Voice) you want to broadcast to all users.")
+        await call.answer()
+    except Exception as e:
+        logger.error(f"Broadcast setup error: {e}")
+
+@admin_router.message(AdminState.waiting_for_broadcast, F.from_user.id == ADMIN_ID)
+async def execute_broadcast(message: Message, state: FSMContext) -> None:
+    try:
+        await state.clear()
+        processing_msg = await message.answer("⏳ Broadcast started... Please wait.")
+        
+        success = 0
+        failed = 0
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT user_id FROM users WHERE is_banned = 0") as cursor:
+                users = await cursor.fetchall()
+                
+        for (uid,) in users:
+            try:
+                await bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.message_id)
+                success += 1
+            except Exception:
+                failed += 1
+            # Prevent Telegram API FloodWait error
+            await asyncio.sleep(0.1)
+            
+        report = (
+            "✅ <b>Broadcast Completed!</b>\n\n"
+            f"📨 Successfully sent to: {success} users\n"
+            f"❌ Failed (Blocked bot/Didn't reply): {failed} users"
+        )
+        await processing_msg.edit_text(report)
+    except Exception as e:
+        logger.error(f"Broadcast execution error: {e}")
+        await message.answer("❌ Error occurred during broadcast.")
 
 @admin_router.callback_query(F.data.startswith("admin_set_"), F.from_user.id == ADMIN_ID)
 async def admin_setup_callbacks(call: CallbackQuery, state: FSMContext) -> None:
     try:
         action = call.data.replace("admin_set_", "")
         prompts = {
-            "start": ("waiting_for_start_msg", "Send the new START message (Text/Photo/Video/Voice)."),
+            "start": ("waiting_for_start_msg", "Send the new START message (Text/Photo/Video/Voice).\n(Hint: Mention your Instagram Work/Reels providing business here)"),
             "step1": ("waiting_for_step1", "Send the new STEP 1 message (Text/Photo/Video/Voice)."),
             "step2": ("waiting_for_step2", "Send the new STEP 2 message (Text/Photo/Video/Voice)."),
             "step3": ("waiting_for_step3", "Send the new STEP 3 message (Text/Photo/Video/Voice)."),
@@ -263,7 +381,15 @@ def main_steps_keyboard() -> InlineKeyboardMarkup:
 async def send_custom_content(chat_id: int, key: str, reply_markup: Optional[InlineKeyboardMarkup] = None) -> None:
     content = await get_setting(key)
     if not content:
-        await bot.send_message(chat_id, "Admin hasn't set this content yet.", reply_markup=reply_markup)
+        default_msgs = {
+            "start_msg": "Welcome! Please check Admin Panel and setup this message.",
+            "step1_msg": "Admin hasn't set Step 1 yet.",
+            "step2_msg": "Admin hasn't set Step 2 yet.",
+            "step3_msg": "Admin hasn't set Step 3 yet.",
+            "step4_msg": "Admin hasn't set Step 4 yet."
+        }
+        fallback_text = default_msgs.get(key, "Admin hasn't set this content yet.")
+        await bot.send_message(chat_id, fallback_text, reply_markup=reply_markup)
         return
 
     text_val, media_id, media_type = content
@@ -282,6 +408,9 @@ async def send_custom_content(chat_id: int, key: str, reply_markup: Optional[Inl
 @user_router.message(CommandStart())
 async def start_cmd(message: Message) -> None:
     try:
+        if await is_user_banned(message.from_user.id):
+            return
+            
         await register_user(message.from_user.id, message.from_user.username)
         await send_custom_content(message.chat.id, "start_msg", reply_markup=main_steps_keyboard())
     except Exception as e:
@@ -290,6 +419,10 @@ async def start_cmd(message: Message) -> None:
 @user_router.callback_query(F.data == "run_step1")
 async def process_step1(call: CallbackQuery) -> None:
     try:
+        if await is_user_banned(call.from_user.id):
+            await call.answer("🚫 You are banned from using this bot.", show_alert=True)
+            return
+            
         await send_custom_content(call.message.chat.id, "step1_msg")
         await call.answer()
     except Exception as e:
@@ -298,6 +431,10 @@ async def process_step1(call: CallbackQuery) -> None:
 @user_router.callback_query(F.data == "run_step2")
 async def process_step2(call: CallbackQuery) -> None:
     try:
+        if await is_user_banned(call.from_user.id):
+            await call.answer("🚫 You are banned from using this bot.", show_alert=True)
+            return
+
         # Fetch 2 random DPs from DP bank
         async with aiosqlite.connect(DB_PATH) as db:
             async with db.execute("SELECT file_id FROM dp_bank ORDER BY RANDOM() LIMIT 2") as cursor:
@@ -307,11 +444,11 @@ async def process_step2(call: CallbackQuery) -> None:
             media_group = [InputMediaPhoto(media=dp[0]) for dp in dps]
             await bot.send_media_group(call.message.chat.id, media=media_group)
         else:
-            await bot.send_message(call.message.chat.id, "No DPs found in bank.")
+            pass # Keep it clean if no DP exists, just send the instructions below
 
         # Send Step 2 main message with Unlock button for Step 3
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Done this all & Send Details to Admin. Click to Unlock Step 3", callback_data="req_unlock_3")]
+            [InlineKeyboardButton(text="I have done this step", callback_data="req_unlock_3")]
         ])
         await send_custom_content(call.message.chat.id, "step2_msg", reply_markup=keyboard)
         await call.answer()
@@ -321,15 +458,20 @@ async def process_step2(call: CallbackQuery) -> None:
 @user_router.callback_query(F.data == "req_unlock_3")
 async def request_step3(call: CallbackQuery) -> None:
     try:
+        if await is_user_banned(call.from_user.id):
+            await call.answer("🚫 You are banned.", show_alert=True)
+            return
+
         user_id = call.from_user.id
         username = call.from_user.username or "No Username"
         profile_link = f"<a href='tg://user?id={user_id}'>{username}</a>"
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Approve Step 3", callback_data=f"approve_3_{user_id}")]
+            [InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_3_{user_id}"),
+             InlineKeyboardButton(text="❌ Deny", callback_data=f"deny_3_{user_id}")]
         ])
         
-        admin_msg = f"🔓 <b>Step 3 Unlock Request</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>\n💬 Message ID: {call.message.message_id}"
+        admin_msg = f"🔓 <b>Step 3 Unlock Request</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>\n💬 User says: I have done this step."
         await bot.send_message(ADMIN_ID, admin_msg, reply_markup=keyboard)
         
         await call.message.answer("⏳ Your request for Step 3 has been sent to the admin. Please wait for approval.")
@@ -340,9 +482,13 @@ async def request_step3(call: CallbackQuery) -> None:
 @user_router.callback_query(F.data == "run_step3")
 async def process_step3(call: CallbackQuery) -> None:
     try:
+        if await is_user_banned(call.from_user.id):
+            await call.answer("🚫 You are banned.", show_alert=True)
+            return
+
         user_data = await get_user(call.from_user.id)
         if not user_data or user_data[0] == 0:
-            await call.answer("❌ Step 3 is locked! Complete Step 2 and request admin approval first.", show_alert=True)
+            await call.answer("❌ Access Denied. Contact Admin.", show_alert=True)
             return
 
         batch_counter = user_data[2]
@@ -367,7 +513,7 @@ async def process_step3(call: CallbackQuery) -> None:
 
         # Send Step 3 custom content with Unlock Step 4 button
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Unlock Step 4", callback_data="req_unlock_4")]
+            [InlineKeyboardButton(text="I have done this step", callback_data="req_unlock_4")]
         ])
         await send_custom_content(call.message.chat.id, "step3_msg", reply_markup=keyboard)
         await call.answer()
@@ -377,15 +523,20 @@ async def process_step3(call: CallbackQuery) -> None:
 @user_router.callback_query(F.data == "req_unlock_4")
 async def request_step4(call: CallbackQuery) -> None:
     try:
+        if await is_user_banned(call.from_user.id):
+            await call.answer("🚫 You are banned.", show_alert=True)
+            return
+
         user_id = call.from_user.id
         username = call.from_user.username or "No Username"
         profile_link = f"<a href='tg://user?id={user_id}'>{username}</a>"
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Approve Step 4", callback_data=f"approve_4_{user_id}")]
+            [InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_4_{user_id}"),
+             InlineKeyboardButton(text="❌ Deny", callback_data=f"deny_4_{user_id}")]
         ])
         
-        admin_msg = f"🔓 <b>Step 4 Unlock Request</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>\n💬 Message ID: {call.message.message_id}"
+        admin_msg = f"🔓 <b>Step 4 Unlock Request</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>\n💬 User says: I have done this step."
         await bot.send_message(ADMIN_ID, admin_msg, reply_markup=keyboard)
         
         await call.message.answer("⏳ Your request for Step 4 has been sent to the admin. Please wait for approval.")
@@ -396,9 +547,13 @@ async def request_step4(call: CallbackQuery) -> None:
 @user_router.callback_query(F.data == "run_step4")
 async def process_step4(call: CallbackQuery) -> None:
     try:
+        if await is_user_banned(call.from_user.id):
+            await call.answer("🚫 You are banned.", show_alert=True)
+            return
+
         user_data = await get_user(call.from_user.id)
         if not user_data or user_data[1] == 0:
-            await call.answer("❌ Step 4 is locked! Complete Step 3 and request admin approval first.", show_alert=True)
+            await call.answer("❌ Access Denied. Contact Admin.", show_alert=True)
             return
 
         await send_custom_content(call.message.chat.id, "step4_msg")
@@ -417,10 +572,10 @@ async def admin_approve_request(call: CallbackQuery) -> None:
         async with aiosqlite.connect(DB_PATH) as db:
             if step == "3":
                 await db.execute("UPDATE users SET step3_unlocked = 1 WHERE user_id = ?", (target_user_id,))
-                msg_to_user = "🎉 Congrats! Admin has approved your request. Step 3 is now unlocked! Click Step 3 from the main menu."
+                msg_to_user = "✅ Successfully unlocked your Step 3. Please check and run Step 3 from the main menu."
             elif step == "4":
                 await db.execute("UPDATE users SET step4_unlocked = 1 WHERE user_id = ?", (target_user_id,))
-                msg_to_user = "🎉 Congrats! Admin has approved your request. Step 4 is now unlocked! Click Step 4 from the main menu."
+                msg_to_user = "✅ Successfully unlocked your Step 4. Please check and run Step 4 from the main menu."
             await db.commit()
 
         await call.message.edit_text(f"{call.message.html_text}\n\n✅ <b>Approved Successfully</b>")
@@ -434,6 +589,25 @@ async def admin_approve_request(call: CallbackQuery) -> None:
         await call.answer("Approved!")
     except Exception as e:
         logger.error(f"Approval callback error: {e}")
+
+@admin_router.callback_query(F.data.startswith("deny_"), F.from_user.id == ADMIN_ID)
+async def admin_deny_request(call: CallbackQuery) -> None:
+    try:
+        parts = call.data.split('_')
+        step = parts[1]
+        target_user_id = int(parts[2])
+
+        await call.message.edit_text(f"{call.message.html_text}\n\n❌ <b>Denied by Admin</b>")
+        
+        # Notify the user
+        try:
+            await bot.send_message(target_user_id, f"❌ Your request to unlock Step {step} was denied by the Admin. Please check your tasks again.")
+        except TelegramAPIError:
+            logger.warning(f"Could not notify user {target_user_id} about denial.")
+            
+        await call.answer("Request Denied.")
+    except Exception as e:
+        logger.error(f"Denial callback error: {e}")
 
 # ----------------- MAIN RUNNER ----------------- #
 async def main() -> None:
