@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import asyncio
 import logging
 import random
@@ -11,7 +12,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, 
-    InlineKeyboardButton
+    InlineKeyboardButton, FSInputFile
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -158,6 +159,51 @@ async def deliver_random_dump_videos(
             
     return user_sent_batches
 
+# ----------------- BACKUP SYSTEM (NEW) ----------------- #
+async def generate_backup() -> str:
+    """Creates a JSON backup of the entire MongoDB database."""
+    backup_data = {}
+    try:
+        collections = await db.list_collection_names()
+        for coll_name in collections:
+            cursor = db[coll_name].find({})
+            docs = await cursor.to_list(length=None)
+            for doc in docs:
+                if '_id' in doc:
+                    doc['_id'] = str(doc['_id'])
+            backup_data[coll_name] = docs
+            
+        backup_file = "database_backup.json"
+        with open(backup_file, "w", encoding="utf-8") as f:
+            json.dump(backup_data, f, indent=4)
+        return backup_file
+    except Exception as e:
+        logger.error(f"Error generating backup file: {e}")
+        return ""
+
+async def send_backup(bot: Bot, admin_id: int) -> None:
+    """Sends the JSON backup to the Admin and deletes it from the VPS."""
+    try:
+        backup_file = await generate_backup()
+        if backup_file and os.path.exists(backup_file):
+            document = FSInputFile(backup_file)
+            await bot.send_document(
+                chat_id=admin_id, 
+                document=document, 
+                caption="📦 <b>Automated Database Backup</b>\n\nAll users, settings, and step configurations are included. Your VPS remains clean (file is automatically deleted from the server)."
+            )
+            # Ensure the VPS remains completely empty of media/data files
+            os.remove(backup_file)
+            logger.info("Backup sent and VPS cleaned successfully.")
+    except Exception as e:
+        logger.error(f"Failed to send automated backup: {e}")
+
+async def auto_backup_task(bot: Bot, admin_id: int) -> None:
+    """Runs continuously in the background, executing every 8 hours."""
+    while True:
+        await asyncio.sleep(8 * 3600)  # Wait for 8 hours
+        await send_backup(bot, admin_id)
+
 # ----------------- ADMIN STATES & HANDLERS ----------------- #
 class AdminState(StatesGroup):
     waiting_for_start_msg = State()
@@ -176,7 +222,8 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Set DP Channel ID", callback_data="admin_set_dp_channel"),
          InlineKeyboardButton(text="Set Dump Channel ID", callback_data="admin_set_dump_channel")],
         [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast"),
-         InlineKeyboardButton(text="📊 Stats", callback_data="admin_stats")]
+         InlineKeyboardButton(text="📊 Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📦 Manual Backup", callback_data="admin_backup")]
     ])
 
 @admin_router.message(Command("admin"), F.from_user.id == ADMIN_ID)
@@ -247,6 +294,15 @@ async def show_stats(call: CallbackQuery) -> None:
         await call.answer()
     except Exception as e:
         logger.error(f"Stats error: {e}")
+
+@admin_router.callback_query(F.data == "admin_backup", F.from_user.id == ADMIN_ID)
+async def manual_backup_cmd(call: CallbackQuery) -> None:
+    try:
+        await call.message.answer("⏳ Generating and sending database backup...")
+        await send_backup(bot, ADMIN_ID)
+        await call.answer("Backup generated and sent successfully!")
+    except Exception as e:
+        logger.error(f"Manual Backup error: {e}")
 
 @admin_router.callback_query(F.data == "admin_broadcast", F.from_user.id == ADMIN_ID)
 async def setup_broadcast(call: CallbackQuery, state: FSMContext) -> None:
@@ -331,7 +387,7 @@ async def add_part_prompt(call: CallbackQuery, state: FSMContext) -> None:
         await state.update_data(expected_type=msg_type)
         await state.set_state(AdminState.waiting_for_step_content)
         
-        await call.message.edit_text(f"📤 Please send the <b>{msg_type.upper()}</b> for {step_name.upper()}.\n\n<i>Note: You can add captions if sending media.</i>")
+        await call.message.edit_text(f"📤 Please send the <b>{msg_type.upper()}</b> for {step_name.upper()}.\n\n<i>Note: You can add captions if sending media. MP3 and MP4 files are also accepted.</i>")
         await call.answer()
     except Exception as e:
         logger.error(f"Add part prompt error: {e}")
@@ -352,14 +408,25 @@ async def save_step_part(message: Message, state: FSMContext) -> None:
         media_id = None
         msg_type = 'text'
         
+        # Enhanced format detection to intelligently accept MP3s, MP4s, and Document formats
         if expected_type == 'photo' and message.photo:
             media_id = message.photo[-1].file_id
             msg_type = 'photo'
-        elif expected_type == 'video' and message.video:
-            media_id = message.video.file_id
+        elif expected_type == 'video' and (message.video or message.animation or message.document):
+            if message.video:
+                media_id = message.video.file_id
+            elif message.animation:
+                media_id = message.animation.file_id
+            elif message.document:
+                media_id = message.document.file_id
             msg_type = 'video'
-        elif expected_type == 'voice' and message.voice:
-            media_id = message.voice.file_id
+        elif expected_type == 'voice' and (message.voice or message.audio or message.document):
+            if message.voice:
+                media_id = message.voice.file_id
+            elif message.audio: # Captures MP3 files natively
+                media_id = message.audio.file_id
+            elif message.document:
+                media_id = message.document.file_id
             msg_type = 'voice'
         elif expected_type == 'text' and message.text:
             msg_type = 'text'
@@ -519,6 +586,19 @@ async def save_media_setting(message: Message, state: FSMContext, key_name: str)
         elif message.voice:
             media_id = message.voice.file_id
             media_type = 'voice'
+        elif message.audio:
+            media_id = message.audio.file_id
+            media_type = 'voice'
+        elif message.animation:
+            media_id = message.animation.file_id
+            media_type = 'video'
+        elif message.document:
+            media_id = message.document.file_id
+            mime = message.document.mime_type or ""
+            if "audio" in mime:
+                media_type = 'voice'
+            else:
+                media_type = 'video'
 
         await set_setting(key_name, text_val, media_id, media_type)
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -693,9 +773,15 @@ async def send_custom_step_content(chat_id: int, step_name: str, final_markup: O
                 if msg_type == 'photo':
                     await bot.send_photo(chat_id, photo=media_id, caption=text_val, reply_markup=markup)
                 elif msg_type == 'video':
-                    await bot.send_video(chat_id, video=media_id, caption=text_val, reply_markup=markup)
+                    try:
+                        await bot.send_video(chat_id, video=media_id, caption=text_val, reply_markup=markup)
+                    except TelegramAPIError:
+                        await bot.send_document(chat_id, document=media_id, caption=text_val, reply_markup=markup)
                 elif msg_type == 'voice':
-                    await bot.send_voice(chat_id, voice=media_id, caption=text_val, reply_markup=markup)
+                    try:
+                        await bot.send_voice(chat_id, voice=media_id, caption=text_val, reply_markup=markup)
+                    except TelegramAPIError:
+                        await bot.send_audio(chat_id, audio=media_id, caption=text_val, reply_markup=markup)
                 else:
                     await bot.send_message(chat_id, text=text_val, reply_markup=markup)
             except TelegramAPIError as e:
@@ -726,9 +812,15 @@ async def start_cmd(message: Message) -> None:
         if media_type == 'photo':
             await message.answer_photo(photo=media_id, caption=text_val, reply_markup=keyboard)
         elif media_type == 'video':
-            await message.answer_video(video=media_id, caption=text_val, reply_markup=keyboard)
+            try:
+                await message.answer_video(video=media_id, caption=text_val, reply_markup=keyboard)
+            except TelegramAPIError:
+                await message.answer_document(document=media_id, caption=text_val, reply_markup=keyboard)
         elif media_type == 'voice':
-            await message.answer_voice(voice=media_id, caption=text_val, reply_markup=keyboard)
+            try:
+                await message.answer_voice(voice=media_id, caption=text_val, reply_markup=keyboard)
+            except TelegramAPIError:
+                await message.answer_audio(audio=media_id, caption=text_val, reply_markup=keyboard)
         else:
             await message.answer(text=text_val, reply_markup=keyboard)
             
@@ -948,6 +1040,10 @@ async def admin_deny_request(call: CallbackQuery) -> None:
 # ----------------- MAIN RUNNER ----------------- #
 async def main() -> None:
     await init_db()
+    
+    # START AUTO BACKUP TASK IN BACKGROUND
+    asyncio.create_task(auto_backup_task(bot, ADMIN_ID))
+    
     logger.info("Bot is successfully running...")
     try:
         await bot.delete_webhook(drop_pending_updates=True)
