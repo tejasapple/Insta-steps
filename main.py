@@ -24,9 +24,13 @@ import motor.motor_asyncio
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+ADMIN_ID_2 = int(os.getenv("ADMIN_ID_2", 0))
+
+# Store valid admin IDs dynamically
+ADMIN_IDS = [aid for aid in (ADMIN_ID, ADMIN_ID_2) if aid != 0]
 MONGO_URI = os.getenv("MONGO_URI")
 
-if not BOT_TOKEN or not ADMIN_ID or not MONGO_URI:
+if not BOT_TOKEN or not ADMIN_IDS or not MONGO_URI:
     raise ValueError("Bhai, .env file mein BOT_TOKEN, ADMIN_ID aur MONGO_URI set karna zaruri hai!")
 
 # Setup robust logging
@@ -183,28 +187,33 @@ async def generate_backup() -> str:
         logger.error(f"Error generating backup file: {e}")
         return ""
 
-async def send_backup(bot: Bot, admin_id: int) -> None:
-    """Sends the JSON backup to the Admin and deletes it from the VPS."""
+async def send_backup(bot: Bot, admin_ids: List[int]) -> None:
+    """Sends the JSON backup to all Admins and deletes it from the VPS."""
     try:
         backup_file = await generate_backup()
         if backup_file and os.path.exists(backup_file):
-            document = FSInputFile(backup_file)
-            await bot.send_document(
-                chat_id=admin_id, 
-                document=document, 
-                caption="📦 <b>Automated Database Backup</b>\n\nAll users, settings, and step configurations are included. Your VPS remains clean (file is automatically deleted from the server)."
-            )
+            for admin_id in admin_ids:
+                try:
+                    document = FSInputFile(backup_file)
+                    await bot.send_document(
+                        chat_id=admin_id, 
+                        document=document, 
+                        caption="📦 <b>Automated Database Backup</b>\n\nAll users, settings, and step configurations are included. Your VPS remains clean (file is automatically deleted from the server)."
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to send automated backup to {admin_id}: {e}")
+                    
             # Ensure the VPS remains completely empty of media/data files
             os.remove(backup_file)
-            logger.info("Backup sent and VPS cleaned successfully.")
+            logger.info("Backup sent to admins and VPS cleaned successfully.")
     except Exception as e:
-        logger.error(f"Failed to send automated backup: {e}")
+        logger.error(f"Failed to process backup operation: {e}")
 
-async def auto_backup_task(bot: Bot, admin_id: int) -> None:
+async def auto_backup_task(bot: Bot, admin_ids: List[int]) -> None:
     """Runs continuously in the background, executing every 8 hours."""
     while True:
         await asyncio.sleep(8 * 3600)  # Wait for 8 hours
-        await send_backup(bot, admin_id)
+        await send_backup(bot, admin_ids)
 
 # ----------------- ADMIN STATES & HANDLERS ----------------- #
 class AdminState(StatesGroup):
@@ -228,11 +237,11 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📦 Manual Backup", callback_data="admin_backup")]
     ])
 
-@admin_router.message(Command("admin"), F.from_user.id == ADMIN_ID)
+@admin_router.message(Command("admin"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_panel_cmd(message: Message, state: FSMContext) -> None:
     await send_admin_panel(message.chat.id, state)
 
-@admin_router.callback_query(F.data == "admin_panel_open", F.from_user.id == ADMIN_ID)
+@admin_router.callback_query(F.data == "admin_panel_open", F.from_user.id.in_(ADMIN_IDS))
 async def admin_panel_callback(call: CallbackQuery, state: FSMContext) -> None:
     await send_admin_panel(call.message.chat.id, state)
     await call.answer()
@@ -251,7 +260,7 @@ async def send_admin_panel(chat_id: int, state: FSMContext) -> None:
     except TelegramAPIError as e:
         logger.error(f"Admin panel error: {e}")
 
-@admin_router.message(Command("ban"), F.from_user.id == ADMIN_ID)
+@admin_router.message(Command("ban"), F.from_user.id.in_(ADMIN_IDS))
 async def ban_user_cmd(message: Message) -> None:
     try:
         args = message.text.split()
@@ -265,7 +274,7 @@ async def ban_user_cmd(message: Message) -> None:
         logger.error(f"Ban error: {e}")
         await message.answer("❌ Invalid User ID or Error occurred.")
 
-@admin_router.message(Command("unban"), F.from_user.id == ADMIN_ID)
+@admin_router.message(Command("unban"), F.from_user.id.in_(ADMIN_IDS))
 async def unban_user_cmd(message: Message) -> None:
     try:
         args = message.text.split()
@@ -279,7 +288,7 @@ async def unban_user_cmd(message: Message) -> None:
         logger.error(f"Unban error: {e}")
         await message.answer("❌ Invalid User ID or Error occurred.")
 
-@admin_router.callback_query(F.data == "admin_stats", F.from_user.id == ADMIN_ID)
+@admin_router.callback_query(F.data == "admin_stats", F.from_user.id.in_(ADMIN_IDS))
 async def show_stats(call: CallbackQuery) -> None:
     try:
         total_users = await db.users.count_documents({})
@@ -297,16 +306,16 @@ async def show_stats(call: CallbackQuery) -> None:
     except Exception as e:
         logger.error(f"Stats error: {e}")
 
-@admin_router.callback_query(F.data == "admin_backup", F.from_user.id == ADMIN_ID)
+@admin_router.callback_query(F.data == "admin_backup", F.from_user.id.in_(ADMIN_IDS))
 async def manual_backup_cmd(call: CallbackQuery) -> None:
     try:
         await call.message.answer("⏳ Generating and sending database backup...")
-        await send_backup(bot, ADMIN_ID)
+        await send_backup(bot, ADMIN_IDS)
         await call.answer("Backup generated and sent successfully!")
     except Exception as e:
         logger.error(f"Manual Backup error: {e}")
 
-@admin_router.callback_query(F.data == "admin_broadcast", F.from_user.id == ADMIN_ID)
+@admin_router.callback_query(F.data == "admin_broadcast", F.from_user.id.in_(ADMIN_IDS))
 async def setup_broadcast(call: CallbackQuery, state: FSMContext) -> None:
     try:
         await state.set_state(AdminState.waiting_for_broadcast)
@@ -315,7 +324,7 @@ async def setup_broadcast(call: CallbackQuery, state: FSMContext) -> None:
     except Exception as e:
         logger.error(f"Broadcast setup error: {e}")
 
-@admin_router.message(AdminState.waiting_for_broadcast, F.from_user.id == ADMIN_ID)
+@admin_router.message(AdminState.waiting_for_broadcast, F.from_user.id.in_(ADMIN_IDS))
 async def execute_broadcast(message: Message, state: FSMContext) -> None:
     try:
         await state.clear()
@@ -344,7 +353,7 @@ async def execute_broadcast(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Error occurred during broadcast.")
 
 # ----------------- ADMIN MULTI-MESSAGE STEP SETUP ----------------- #
-@admin_router.callback_query(F.data.startswith("admin_edit_step"), F.from_user.id == ADMIN_ID)
+@admin_router.callback_query(F.data.startswith("admin_edit_step"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_edit_step(call: CallbackQuery, state: FSMContext) -> None:
     try:
         step_name = call.data.replace("admin_edit_", "")
@@ -379,7 +388,7 @@ async def admin_edit_step(call: CallbackQuery, state: FSMContext) -> None:
     except Exception as e:
         logger.error(f"Admin edit step error: {e}")
 
-@admin_router.callback_query(F.data.startswith("add_part_"), F.from_user.id == ADMIN_ID)
+@admin_router.callback_query(F.data.startswith("add_part_"), F.from_user.id.in_(ADMIN_IDS))
 async def add_part_prompt(call: CallbackQuery, state: FSMContext) -> None:
     try:
         msg_type = call.data.replace("add_part_", "")
@@ -394,7 +403,7 @@ async def add_part_prompt(call: CallbackQuery, state: FSMContext) -> None:
     except Exception as e:
         logger.error(f"Add part prompt error: {e}")
 
-@admin_router.message(AdminState.waiting_for_step_content, F.from_user.id == ADMIN_ID)
+@admin_router.message(AdminState.waiting_for_step_content, F.from_user.id.in_(ADMIN_IDS))
 async def save_step_part(message: Message, state: FSMContext) -> None:
     try:
         data = await state.get_data()
@@ -455,7 +464,7 @@ async def save_step_part(message: Message, state: FSMContext) -> None:
     except Exception as e:
         logger.error(f"Error saving step part: {e}")
 
-@admin_router.callback_query(F.data == "clear_step_parts", F.from_user.id == ADMIN_ID)
+@admin_router.callback_query(F.data == "clear_step_parts", F.from_user.id.in_(ADMIN_IDS))
 async def clear_step_parts(call: CallbackQuery, state: FSMContext) -> None:
     try:
         data = await state.get_data()
@@ -555,7 +564,7 @@ async def get_channel_total_count(bot: Bot, chat_id: str, base_msg_id: int, admi
         return 500 # Fallback pool size
 
 # ----------------- ADMIN SINGLE SETTINGS ----------------- #
-@admin_router.callback_query(F.data.startswith("admin_set_"), F.from_user.id == ADMIN_ID)
+@admin_router.callback_query(F.data.startswith("admin_set_"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_setup_single_callbacks(call: CallbackQuery, state: FSMContext) -> None:
     try:
         action = call.data.replace("admin_set_", "")
@@ -612,11 +621,11 @@ async def save_media_setting(message: Message, state: FSMContext, key_name: str)
         logger.error(f"Error saving media setting: {e}")
         await message.answer("❌ Error saving setting.")
 
-@admin_router.message(AdminState.waiting_for_start_msg, F.from_user.id == ADMIN_ID)
+@admin_router.message(AdminState.waiting_for_start_msg, F.from_user.id.in_(ADMIN_IDS))
 async def save_start(msg: Message, state: FSMContext) -> None: 
     await save_media_setting(msg, state, "start_msg")
 
-@admin_router.message(AdminState.waiting_for_dp_channel, F.from_user.id == ADMIN_ID)
+@admin_router.message(AdminState.waiting_for_dp_channel, F.from_user.id.in_(ADMIN_IDS))
 async def save_dp_channel(message: Message, state: FSMContext) -> None:
     try:
         chat_id, base_msg_id = await extract_channel_info(message)
@@ -632,7 +641,8 @@ async def save_dp_channel(message: Message, state: FSMContext) -> None:
             await processing_msg.edit_text("❌ Bot cannot access this channel. Please ensure the bot is added as an Admin to the channel first!")
             return
 
-        total_count = await get_channel_total_count(bot, chat_id, base_msg_id, ADMIN_ID)
+        # Pass the first admin ID dynamically for copy message verification testing
+        total_count = await get_channel_total_count(bot, chat_id, base_msg_id, ADMIN_IDS[0])
 
         await set_setting("dp_channel", chat_id)
         
@@ -657,7 +667,7 @@ async def save_dp_channel(message: Message, state: FSMContext) -> None:
         logger.error(f"Error saving DP channel: {e}")
         await message.answer("❌ Error saving DP channel.")
 
-@admin_router.message(AdminState.waiting_for_dump_channel, F.from_user.id == ADMIN_ID)
+@admin_router.message(AdminState.waiting_for_dump_channel, F.from_user.id.in_(ADMIN_IDS))
 async def save_dump_channel(message: Message, state: FSMContext) -> None:
     try:
         chat_id, base_msg_id = await extract_channel_info(message)
@@ -673,7 +683,8 @@ async def save_dump_channel(message: Message, state: FSMContext) -> None:
             await processing_msg.edit_text("❌ Bot cannot access this channel. Please ensure the bot is added as an Admin to the channel first!")
             return
 
-        total_count = await get_channel_total_count(bot, chat_id, base_msg_id, ADMIN_ID)
+        # Pass the first admin ID dynamically for copy message verification testing
+        total_count = await get_channel_total_count(bot, chat_id, base_msg_id, ADMIN_IDS[0])
 
         await set_setting("dump_channel", chat_id)
         
@@ -804,7 +815,7 @@ async def start_cmd(message: Message) -> None:
         await register_user(message.from_user.id, message.from_user.username)
         
         content = await get_setting("start_msg")
-        is_admin = (message.from_user.id == ADMIN_ID)
+        is_admin = (message.from_user.id in ADMIN_IDS)
         keyboard = main_steps_keyboard(is_admin)
         
         if not content:
@@ -900,9 +911,31 @@ async def request_step3(call: CallbackQuery) -> None:
         ])
         
         admin_msg = f"🔓 <b>Step 3 Unlock Request</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>\n💬 User says: I have done this step."
-        await bot.send_message(ADMIN_ID, admin_msg, reply_markup=keyboard)
         
-        await call.message.answer("⏳ Your request for Step 3 has been sent to the admin. Please wait for approval.")
+        # 1. Fetch user data to delete any pending spam requests
+        user_data = await get_user(user_id)
+        if user_data:
+            old_msgs = user_data.get("pending_step3_msgs", {})
+            # Try to delete previous request messages sent to admins
+            for adm_id_str, msg_id in old_msgs.items():
+                try:
+                    await bot.delete_message(chat_id=int(adm_id_str), message_id=msg_id)
+                except Exception:
+                    pass
+        
+        # 2. Send the NEW request to all admins
+        new_msgs = {}
+        for admin in ADMIN_IDS:
+            try:
+                sent_msg = await bot.send_message(admin, admin_msg, reply_markup=keyboard)
+                new_msgs[str(admin)] = sent_msg.message_id
+            except Exception as e:
+                logger.error(f"Failed to send Step 3 request to Admin {admin}: {e}")
+                
+        # 3. Store the new request message IDs in the database for future tracking
+        await db.users.update_one({"user_id": user_id}, {"$set": {"pending_step3_msgs": new_msgs}})
+        
+        await call.message.answer("⏳ Your request for Step 3 has been sent to the admin(s). Please wait for approval.")
         await call.answer()
     except Exception as e:
         logger.error(f"Request Step 3 error: {e}")
@@ -973,9 +1006,31 @@ async def request_step4(call: CallbackQuery) -> None:
         ])
         
         admin_msg = f"🔓 <b>Step 4 Unlock Request</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>\n💬 User says: I have done this step."
-        await bot.send_message(ADMIN_ID, admin_msg, reply_markup=keyboard)
         
-        await call.message.answer("⏳ Your request for Step 4 has been sent to the admin. Please wait for approval.")
+        # 1. Fetch user data to delete any pending spam requests
+        user_data = await get_user(user_id)
+        if user_data:
+            old_msgs = user_data.get("pending_step4_msgs", {})
+            # Try to delete previous request messages sent to admins
+            for adm_id_str, msg_id in old_msgs.items():
+                try:
+                    await bot.delete_message(chat_id=int(adm_id_str), message_id=msg_id)
+                except Exception:
+                    pass
+        
+        # 2. Send the NEW request to all admins
+        new_msgs = {}
+        for admin in ADMIN_IDS:
+            try:
+                sent_msg = await bot.send_message(admin, admin_msg, reply_markup=keyboard)
+                new_msgs[str(admin)] = sent_msg.message_id
+            except Exception as e:
+                logger.error(f"Failed to send Step 4 request to Admin {admin}: {e}")
+                
+        # 3. Store the new request message IDs in the database for future tracking
+        await db.users.update_one({"user_id": user_id}, {"$set": {"pending_step4_msgs": new_msgs}})
+        
+        await call.message.answer("⏳ Your request for Step 4 has been sent to the admin(s). Please wait for approval.")
         await call.answer()
     except Exception as e:
         logger.error(f"Request Step 4 error: {e}")
@@ -998,7 +1053,7 @@ async def process_step4(call: CallbackQuery) -> None:
         logger.error(f"Step 4 error: {e}")
 
 # ----------------- ADMIN APPROVAL CALLBACKS ----------------- #
-@admin_router.callback_query(F.data.startswith("approve_"), F.from_user.id == ADMIN_ID)
+@admin_router.callback_query(F.data.startswith("approve_"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_approve_request(call: CallbackQuery) -> None:
     try:
         parts = call.data.split('_')
@@ -1012,8 +1067,25 @@ async def admin_approve_request(call: CallbackQuery) -> None:
             await db.users.update_one({"user_id": target_user_id}, {"$set": {"step4_unlocked": 1}})
             msg_to_user = "✅ Successfully unlocked your Step 4. Please check and run Step 4 from the main menu."
 
-        await call.message.edit_text(f"{call.message.html_text}\n\n✅ <b>Approved Successfully</b>")
+        # Update the message dynamically for ALL admins to show it's approved
+        user_data = await get_user(target_user_id)
+        pending_msgs = user_data.get(f"pending_step{step}_msgs", {})
         
+        # Remove the tracking since it is now processed
+        await db.users.update_one({"user_id": target_user_id}, {"$unset": {f"pending_step{step}_msgs": ""}})
+        
+        new_text = f"{call.message.html_text}\n\n✅ <b>Approved by Admin {call.from_user.id}</b>"
+        
+        if not pending_msgs:
+            # Fallback if dictionary was cleared
+            await call.message.edit_text(new_text)
+        else:
+            for adm_id_str, msg_id in pending_msgs.items():
+                try:
+                    await bot.edit_message_text(chat_id=int(adm_id_str), message_id=msg_id, text=new_text)
+                except Exception:
+                    pass
+
         try:
             await bot.send_message(target_user_id, msg_to_user)
         except TelegramAPIError:
@@ -1023,14 +1095,31 @@ async def admin_approve_request(call: CallbackQuery) -> None:
     except Exception as e:
         logger.error(f"Approval callback error: {e}")
 
-@admin_router.callback_query(F.data.startswith("deny_"), F.from_user.id == ADMIN_ID)
+@admin_router.callback_query(F.data.startswith("deny_"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_deny_request(call: CallbackQuery) -> None:
     try:
         parts = call.data.split('_')
         step = parts[1]
         target_user_id = int(parts[2])
 
-        await call.message.edit_text(f"{call.message.html_text}\n\n❌ <b>Denied by Admin</b>")
+        # Update the message dynamically for ALL admins to show it's denied
+        user_data = await get_user(target_user_id)
+        pending_msgs = user_data.get(f"pending_step{step}_msgs", {})
+        
+        # Remove the tracking since it is now processed
+        await db.users.update_one({"user_id": target_user_id}, {"$unset": {f"pending_step{step}_msgs": ""}})
+        
+        new_text = f"{call.message.html_text}\n\n❌ <b>Denied by Admin {call.from_user.id}</b>"
+        
+        if not pending_msgs:
+            # Fallback
+            await call.message.edit_text(new_text)
+        else:
+            for adm_id_str, msg_id in pending_msgs.items():
+                try:
+                    await bot.edit_message_text(chat_id=int(adm_id_str), message_id=msg_id, text=new_text)
+                except Exception:
+                    pass
         
         try:
             await bot.send_message(target_user_id, f"❌ Your request to unlock Step {step} was denied by the Admin. Please check your tasks again.")
@@ -1045,8 +1134,8 @@ async def admin_deny_request(call: CallbackQuery) -> None:
 async def main() -> None:
     await init_db()
     
-    # START AUTO BACKUP TASK IN BACKGROUND
-    asyncio.create_task(auto_backup_task(bot, ADMIN_ID))
+    # START AUTO BACKUP TASK IN BACKGROUND (Sends backup to all configured admins)
+    asyncio.create_task(auto_backup_task(bot, ADMIN_IDS))
     
     logger.info("Bot is successfully running...")
     try:
