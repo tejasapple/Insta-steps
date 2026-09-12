@@ -130,7 +130,14 @@ async def deliver_random_dump_videos(
     selected_batches = random.sample(available_batches, batches_to_send)
     
     # 4. Extract and copy messages from the Dump Channel
-    for batch_idx in selected_batches:
+    for idx, batch_idx in enumerate(selected_batches):
+        # Notify user about the current batch
+        try:
+            await bot.send_message(chat_id=user_id, text=f"<b>Batch {idx + 1}</b>")
+            await asyncio.sleep(0.3)
+        except Exception as e:
+            logger.error(f"Failed to send Batch {idx + 1} text to {user_id}: {e}")
+
         start_msg_id = base_msg_id + (batch_idx * 6)
         
         success_count = 0
@@ -667,11 +674,20 @@ async def send_custom_step_content(chat_id: int, step_name: str, final_markup: O
             await bot.send_message(chat_id, f"⚠️ Admin hasn't set any messages for {step_name.title()} yet.", reply_markup=final_markup)
             return
 
-        for i, msg in enumerate(messages):
+        # Separate regular messages from voice messages to ensure voice messages go at the very bottom
+        regular_msgs = [m for m in messages if m.get("msg_type") != 'voice']
+        voice_msgs = [m for m in messages if m.get("msg_type") == 'voice']
+        
+        # Combine them so voices are always at the end
+        ordered_messages = regular_msgs + voice_msgs
+
+        for i, msg in enumerate(ordered_messages):
             msg_type = msg.get("msg_type")
             media_id = msg.get("media_id")
             text_val = msg.get("text_val", "")
-            markup = final_markup if i == len(messages) - 1 else None
+            
+            # Attach the markup (button) strictly to the final message in the newly ordered list
+            markup = final_markup if i == len(ordered_messages) - 1 else None
             
             try:
                 if msg_type == 'photo':
@@ -838,6 +854,7 @@ async def process_step3(call: CallbackQuery) -> None:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="I have done this step", callback_data="req_unlock_4")]
         ])
+        # Voice note will automatically be pushed below the videos in this function
         await send_custom_step_content(call.message.chat.id, "step3", final_markup=keyboard)
         await call.answer()
     except Exception as e:
