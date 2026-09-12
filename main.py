@@ -63,7 +63,15 @@ async def init_db() -> None:
         # Create unique index for users to prevent duplicates
         await db.users.create_index("user_id", unique=True)
         await db.settings.create_index("key", unique=True)
-        logger.info("MongoDB initialized successfully.")
+        await db.admins.create_index("user_id", unique=True)
+        
+        # Load dynamically added admins from DB into memory
+        async for admin_doc in db.admins.find({}):
+            aid = admin_doc.get("user_id")
+            if aid and aid not in ADMIN_IDS:
+                ADMIN_IDS.append(aid)
+                
+        logger.info(f"MongoDB initialized successfully. Total Admins: {len(ADMIN_IDS)}")
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
 
@@ -132,23 +140,16 @@ async def deliver_random_dump_videos(
     Core method to fetch random unique videos from a dump channel.
     Returns the updated list of sent_batches for the user so you can save it to MongoDB.
     """
-    # 1. Total available chunks of 6 videos
     total_batches_available = total_videos // 6
-    
-    # 2. Filter out batches the user has already received
     available_batches = [i for i in range(total_batches_available) if i not in user_sent_batches]
     
-    # Check if we have enough unique batches left
     if len(available_batches) < batches_to_send:
         logger.warning(f"Not enough unique videos left for user {user_id}")
-        return user_sent_batches # Return unchanged
+        return user_sent_batches 
 
-    # 3. Randomly select the required number of batches
     selected_batches = random.sample(available_batches, batches_to_send)
     
-    # 4. Extract and copy messages from the Dump Channel
     for idx, batch_idx in enumerate(selected_batches):
-        # Notify user about the current batch
         try:
             await bot.send_message(chat_id=user_id, text=f"<b>Batch {idx + 1}</b>")
             await asyncio.sleep(0.3)
@@ -160,15 +161,13 @@ async def deliver_random_dump_videos(
         success_count = 0
         for i in range(6):
             try:
-                # Using copy_message strictly preserves 100% of the original quality 
-                # as it is a direct server-side clone. 
                 await bot.copy_message(
                     chat_id=user_id,
                     from_chat_id=dump_chat_id,
                     message_id=start_msg_id + i
                 )
                 success_count += 1
-                await asyncio.sleep(0.3) # Anti-flood delay
+                await asyncio.sleep(0.3)
             except Exception as e:
                 logger.error(f"Failed to copy msg {start_msg_id + i} to {user_id}: {e}")
                 
@@ -215,7 +214,6 @@ async def send_backup(bot: Bot, admin_ids: List[int]) -> None:
                 except Exception as e:
                     logger.error(f"Failed to send automated backup to {admin_id}: {e}")
                     
-            # Ensure the VPS remains completely empty of media/data files
             os.remove(backup_file)
             logger.info("Backup sent to admins and VPS cleaned successfully.")
     except Exception as e:
@@ -236,6 +234,7 @@ class AdminState(StatesGroup):
     waiting_for_step_content = State()
     waiting_for_add_user_id = State()
     waiting_for_remove_user_id = State()
+    waiting_for_add_admin_id = State() # New state for adding admins
 
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -257,6 +256,7 @@ def user_management_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🟢 View Active Users", callback_data="admin_view_users")],
         [InlineKeyboardButton(text="➕ Add User", callback_data="admin_add_user_prompt"),
          InlineKeyboardButton(text="❌ Remove User", callback_data="admin_remove_user_prompt")],
+        [InlineKeyboardButton(text="👑 Make Admin", callback_data="admin_add_admin_prompt")],
         [InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel_open")]
     ])
 
@@ -281,11 +281,11 @@ async def send_admin_panel(chat_id: int, state: FSMContext) -> None:
     except TelegramAPIError as e:
         logger.error(f"Admin panel error: {e}")
 
-# ----------------- ADMIN MANAGE USERS ----------------- #
+# ----------------- ADMIN MANAGE USERS & ADMINS ----------------- #
 @admin_router.callback_query(F.data == "admin_manage_users", F.from_user.id.in_(ADMIN_IDS))
 async def manage_users_callback(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await call.message.edit_text("👥 <b>User Management</b>\n\nChoose an action:", reply_markup=user_management_keyboard())
+    await call.message.edit_text("👥 <b>User & Admin Management</b>\n\nChoose an action:", reply_markup=user_management_keyboard())
     await call.answer()
 
 @admin_router.callback_query(F.data == "admin_view_users", F.from_user.id.in_(ADMIN_IDS))
@@ -299,10 +299,11 @@ async def view_active_users(call: CallbackQuery) -> None:
             await call.message.answer("There are currently no active approved users.")
             return
 
-        text_content = "🟢 <b>Active Approved Users:</b>\n\n"
+        text_content = "🟢 <b>Active Approved Users & Admins:</b>\n\n"
         for u in users:
             username = u.get("username") or "NoUsername"
-            text_content += f"👤 {username} (ID: <code>{u['user_id']}</code>)\n"
+            role = "👑 Admin" if u['user_id'] in ADMIN_IDS else "👤 User"
+            text_content += f"{role} | {username} (ID: <code>{u['user_id']}</code>)\n"
 
         if len(text_content) > 3500:
             file_bytes = text_content.replace('<code>', '').replace('</code>', '').replace('<b>', '').replace('</b>', '').encode("utf-8")
@@ -331,7 +332,7 @@ async def process_add_user(message: Message, state: FSMContext) -> None:
         try:
             await bot.send_message(target_id, "✅ Your access to the bot has been approved by the Admin! Send /start to begin.")
         except Exception:
-            pass # User might not have started the bot yet
+            pass
         
         await message.answer(f"✅ User <code>{target_id}</code> has been successfully added/approved.", reply_markup=user_management_keyboard())
         await state.clear()
@@ -339,6 +340,39 @@ async def process_add_user(message: Message, state: FSMContext) -> None:
         await message.answer("❌ Invalid ID format. Please enter numbers only.")
     except Exception as e:
         logger.error(f"Error adding user: {e}")
+
+@admin_router.callback_query(F.data == "admin_add_admin_prompt", F.from_user.id.in_(ADMIN_IDS))
+async def add_admin_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AdminState.waiting_for_add_admin_id)
+    await call.message.edit_text("👑 Please send the <b>User ID</b> you want to promote to Admin.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_users")]]))
+    await call.answer()
+
+@admin_router.message(AdminState.waiting_for_add_admin_id, F.from_user.id.in_(ADMIN_IDS))
+async def process_add_admin(message: Message, state: FSMContext) -> None:
+    try:
+        target_id = int(message.text.strip())
+        if target_id not in ADMIN_IDS:
+            ADMIN_IDS.append(target_id)
+            
+        await db.admins.update_one({"user_id": target_id}, {"$set": {"user_id": target_id}}, upsert=True)
+        # Auto-approve new admin to use bot features
+        await db.users.update_one(
+            {"user_id": target_id},
+            {"$set": {"is_approved": 1, "is_banned": 0}},
+            upsert=True
+        )
+        
+        try:
+            await bot.send_message(target_id, "👑 <b>Congratulations!</b> You have been promoted to Admin. Send /admin to access the panel.")
+        except Exception:
+            pass
+        
+        await message.answer(f"✅ User <code>{target_id}</code> has been successfully promoted to Admin.", reply_markup=user_management_keyboard())
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Invalid ID format. Please enter numbers only.")
+    except Exception as e:
+        logger.error(f"Error adding admin: {e}")
 
 @admin_router.callback_query(F.data == "admin_remove_user_prompt", F.from_user.id.in_(ADMIN_IDS))
 async def remove_user_prompt(call: CallbackQuery, state: FSMContext) -> None:
@@ -350,10 +384,22 @@ async def remove_user_prompt(call: CallbackQuery, state: FSMContext) -> None:
 async def process_remove_user(message: Message, state: FSMContext) -> None:
     try:
         target_id = int(message.text.strip())
+        
+        # Don't let admins ban themselves
+        if target_id == message.from_user.id:
+            await message.answer("❌ You cannot remove yourself.")
+            return
+
         await db.users.update_one(
             {"user_id": target_id},
             {"$set": {"is_approved": 0, "is_banned": 1}}
         )
+        
+        # If they were an admin, remove admin rights
+        if target_id in ADMIN_IDS:
+            ADMIN_IDS.remove(target_id)
+            await db.admins.delete_one({"user_id": target_id})
+            
         await message.answer(f"✅ User <code>{target_id}</code> has been successfully removed and banned from accessing the bot.", reply_markup=user_management_keyboard())
         await state.clear()
     except ValueError:
@@ -395,11 +441,13 @@ async def show_stats(call: CallbackQuery) -> None:
         total_users = await db.users.count_documents({})
         approved_users = await db.users.count_documents({"is_approved": 1, "is_banned": 0})
         banned_users = await db.users.count_documents({"is_banned": 1})
+        total_admins = await db.admins.count_documents({}) + len(ADMIN_IDS) # Rough estimation of unique admins
         
         stats_text = (
             "📊 <b>Bot Statistics</b>\n\n"
             f"👥 Total Users in DB: {total_users}\n"
             f"✅ Active (Approved) Users: {approved_users}\n"
+            f"👑 Total Admins: {len(ADMIN_IDS)}\n"
             f"🚫 Banned Users: {banned_users}\n\n"
             "<i>Note: Real-time blocked/inactive users are calculated after a broadcast.</i>"
         )
@@ -435,7 +483,6 @@ async def execute_broadcast(message: Message, state: FSMContext) -> None:
         success = 0
         failed = 0
         
-        # Only broadcast to approved and not banned users
         async for user_doc in db.users.find({"is_banned": 0, "is_approved": 1}):
             uid = user_doc["user_id"]
             try:
@@ -522,7 +569,6 @@ async def save_step_part(message: Message, state: FSMContext) -> None:
         media_id = None
         msg_type = 'text'
         
-        # Enhanced format detection to intelligently accept MP3s, MP4s, and Document formats
         if expected_type == 'photo' and message.photo:
             media_id = message.photo[-1].file_id
             msg_type = 'photo'
@@ -537,7 +583,7 @@ async def save_step_part(message: Message, state: FSMContext) -> None:
         elif expected_type == 'voice' and (message.voice or message.audio or message.document):
             if message.voice:
                 media_id = message.voice.file_id
-            elif message.audio: # Captures MP3 files natively
+            elif message.audio:
                 media_id = message.audio.file_id
             elif message.document:
                 media_id = message.document.file_id
@@ -604,13 +650,11 @@ async def extract_channel_info(message: Message) -> Tuple[Optional[str], Optiona
         base_msg_id = getattr(message, 'forward_from_message_id', 1)
     elif message.text:
         text = message.text.strip()
-        # Match private channel links: https://t.me/c/123456789/2
         match_private = re.search(r't\.me/c/(\d+)/(\d+)', text)
         if match_private:
             chat_id = f"-100{match_private.group(1)}"
             base_msg_id = int(match_private.group(2))
         else:
-            # Match public channel links: https://t.me/channelname/2
             match_public = re.search(r't\.me/([^/]+)/(\d+)', text)
             if match_public:
                 chat_id = f"@{match_public.group(1)}"
@@ -629,10 +673,9 @@ async def get_channel_total_count(bot: Bot, chat_id: str, base_msg_id: int, admi
         step = 500
         current = base_msg_id + step
         
-        # Probe upwards to find the ceiling
-        for _ in range(20): # Safety limit to max 10,000 messages
+        for _ in range(20):
             success = False
-            for offset in range(3): # Allowance for deleted messages
+            for offset in range(3):
                 try:
                     msg = await bot.copy_message(chat_id=admin_id, from_chat_id=chat_id, message_id=current + offset, disable_notification=True)
                     await bot.delete_message(chat_id=admin_id, message_id=msg.message_id)
@@ -647,7 +690,6 @@ async def get_channel_total_count(bot: Bot, chat_id: str, base_msg_id: int, admi
             else:
                 break
                 
-        # Probe backwards to find the exact last valid ID
         last_valid = highest_found
         for check_id in range(highest_found + step, highest_found, -25):
             if check_id <= highest_found:
@@ -664,7 +706,7 @@ async def get_channel_total_count(bot: Bot, chat_id: str, base_msg_id: int, admi
         return total if total > 0 else 500
     except Exception as e:
         logger.error(f"Error calculating total count: {e}")
-        return 500 # Fallback pool size
+        return 500
 
 # ----------------- ADMIN SINGLE SETTINGS ----------------- #
 @admin_router.callback_query(F.data.startswith("admin_set_"), F.from_user.id.in_(ADMIN_IDS))
@@ -744,12 +786,9 @@ async def save_dp_channel(message: Message, state: FSMContext) -> None:
             await processing_msg.edit_text("❌ Bot cannot access this channel. Please ensure the bot is added as an Admin to the channel first!")
             return
 
-        # Pass the first admin ID dynamically for copy message verification testing
         total_count = await get_channel_total_count(bot, chat_id, base_msg_id, ADMIN_IDS[0])
-
         await set_setting("dp_channel", chat_id)
         
-        # Save base_msg_id and initialized total instead of deleting stats
         await db.settings.update_one(
             {"key": "dp_stats"},
             {"$set": {"base_msg_id": base_msg_id, "total": total_count}},
@@ -786,12 +825,9 @@ async def save_dump_channel(message: Message, state: FSMContext) -> None:
             await processing_msg.edit_text("❌ Bot cannot access this channel. Please ensure the bot is added as an Admin to the channel first!")
             return
 
-        # Pass the first admin ID dynamically for copy message verification testing
         total_count = await get_channel_total_count(bot, chat_id, base_msg_id, ADMIN_IDS[0])
-
         await set_setting("dump_channel", chat_id)
         
-        # Save base_msg_id and initialized total instead of deleting stats
         await db.settings.update_one(
             {"key": "video_stats"},
             {"$set": {"base_msg_id": base_msg_id, "total": total_count}},
@@ -816,10 +852,6 @@ async def save_dump_channel(message: Message, state: FSMContext) -> None:
 @channel_router.message(F.photo | F.video)
 @channel_router.channel_post(F.photo | F.video)
 async def listen_channels(message: Message) -> None:
-    """
-    Keeps photos/videos OUT of MongoDB. 
-    Only records the base_msg_id (lowest msg id) and total count.
-    """
     try:
         dp_setting = await get_setting("dp_channel")
         dump_setting = await get_setting("dump_channel")
@@ -870,11 +902,9 @@ async def send_custom_step_content(chat_id: int, step_name: str, final_markup: O
             await bot.send_message(chat_id, f"⚠️ Admin hasn't set any messages for {step_name.title()} yet.", reply_markup=final_markup)
             return
 
-        # Separate regular messages from voice messages to ensure voice messages go at the very bottom
         regular_msgs = [m for m in messages if m.get("msg_type") != 'voice']
         voice_msgs = [m for m in messages if m.get("msg_type") == 'voice']
         
-        # Combine them so voices are always at the end
         ordered_messages = regular_msgs + voice_msgs
 
         for i, msg in enumerate(ordered_messages):
@@ -882,7 +912,6 @@ async def send_custom_step_content(chat_id: int, step_name: str, final_markup: O
             media_id = msg.get("media_id")
             text_val = msg.get("text_val", "")
             
-            # Attach the markup (button) strictly to the final message in the newly ordered list
             markup = final_markup if i == len(ordered_messages) - 1 else None
             
             try:
@@ -890,7 +919,6 @@ async def send_custom_step_content(chat_id: int, step_name: str, final_markup: O
                     await bot.send_photo(chat_id, photo=media_id, caption=text_val, reply_markup=markup)
                 elif msg_type == 'video':
                     try:
-                        # UPGRADED: Added supports_streaming=True for high-quality playback inside Telegram
                         await bot.send_video(chat_id, video=media_id, caption=text_val, reply_markup=markup, supports_streaming=True)
                     except TelegramAPIError:
                         await bot.send_document(chat_id, document=media_id, caption=text_val, reply_markup=markup)
@@ -920,25 +948,15 @@ async def start_cmd(message: Message) -> None:
             
         await register_user(user_id, username)
         
-        # Check Approval
+        # Check Approval and show 'Apply to Work' button if not approved
         if not await is_user_approved(user_id):
-            profile_link = f"<a href='tg://user?id={user_id}'>{username or 'No Username'}</a>"
-            
-            # Send alert to user
-            await message.answer("❌ <b>Access Denied</b>\n\nYou need admin approval to use this bot. Your request has been sent to the admins.")
-            
-            # Notify Admins with Approve/Deny buttons
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="✅ Approve User", callback_data=f"approve_new_user_{user_id}"),
-                 InlineKeyboardButton(text="❌ Deny", callback_data=f"deny_new_user_{user_id}")]
+                [InlineKeyboardButton(text="📝 Apply to Work", callback_data="apply_to_work")]
             ])
-            admin_msg = f"🔓 <b>New Bot Access Request</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>"
-            
-            for admin in ADMIN_IDS:
-                try:
-                    await bot.send_message(admin, admin_msg, reply_markup=keyboard)
-                except Exception as e:
-                    logger.error(f"Failed to send access request to Admin {admin}: {e}")
+            await message.answer(
+                "👋 <b>Welcome!</b>\n\nYou need to apply and get admin approval before using this bot.", 
+                reply_markup=keyboard
+            )
             return
         
         content = await get_setting("start_msg")
@@ -967,6 +985,38 @@ async def start_cmd(message: Message) -> None:
             
     except Exception as e:
         logger.error(f"Start command error: {e}")
+
+# ----------------- NEW: APPLY TO WORK HANDLER ----------------- #
+@user_router.callback_query(F.data == "apply_to_work")
+async def apply_to_work_callback(call: CallbackQuery) -> None:
+    try:
+        user_id = call.from_user.id
+        username = call.from_user.username or 'No Username'
+
+        if await is_user_approved(user_id):
+            await call.answer("✅ You are already approved! Use /start to begin.", show_alert=True)
+            return
+
+        # Update message for the user so they know it's sent
+        await call.message.edit_text("✅ <b>Your application has been sent to the admins.</b>\n\nPlease wait for approval.")
+
+        # Send approval request to all active admins
+        profile_link = f"<a href='tg://user?id={user_id}'>{username}</a>"
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Approve User", callback_data=f"approve_new_user_{user_id}"),
+             InlineKeyboardButton(text="❌ Deny", callback_data=f"deny_new_user_{user_id}")]
+        ])
+        admin_msg = f"🔓 <b>New Bot Access Request (Apply to Work)</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>"
+        
+        for admin in ADMIN_IDS:
+            try:
+                await bot.send_message(admin, admin_msg, reply_markup=keyboard)
+            except Exception as e:
+                logger.error(f"Failed to send access request to Admin {admin}: {e}")
+                
+        await call.answer("Applied successfully!")
+    except Exception as e:
+        logger.error(f"Apply to work error: {e}")
 
 @admin_router.callback_query(F.data.startswith("approve_new_user_"), F.from_user.id.in_(ADMIN_IDS))
 async def approve_new_user(call: CallbackQuery) -> None:
@@ -1012,7 +1062,6 @@ async def process_step1(call: CallbackQuery) -> None:
             return
 
         await send_custom_step_content(call.message.chat.id, "step1")
-        # Lock Step 1
         await db.users.update_one({"user_id": user_id}, {"$set": {"step1_used": 1}})
         
         await call.answer()
@@ -1043,7 +1092,7 @@ async def process_step2(call: CallbackQuery) -> None:
             dp_chat_id = int(dp_chat_setting[0])
             
             if total > 0:
-                count_to_send = min(2, total) # EXACTLY 2 DPs 
+                count_to_send = min(2, total)
                 selected_offsets = random.sample(range(total), count_to_send)
                 for offset in selected_offsets:
                     msg_id = base_msg_id + offset
@@ -1062,7 +1111,6 @@ async def process_step2(call: CallbackQuery) -> None:
         ])
         await send_custom_step_content(call.message.chat.id, "step2", final_markup=keyboard)
         
-        # Lock Step 2 forever for this user
         await db.users.update_one({"user_id": user_id}, {"$set": {"step2_used": 1}})
         
         await call.answer()
@@ -1087,18 +1135,15 @@ async def request_step3(call: CallbackQuery) -> None:
         
         admin_msg = f"🔓 <b>Step 3 Unlock Request</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>\n💬 User says: I have done this step."
         
-        # 1. Fetch user data to delete any pending spam requests
         user_data = await get_user(user_id)
         if user_data:
             old_msgs = user_data.get("pending_step3_msgs", {})
-            # Try to delete previous request messages sent to admins
             for adm_id_str, msg_id in old_msgs.items():
                 try:
                     await bot.delete_message(chat_id=int(adm_id_str), message_id=msg_id)
                 except Exception:
                     pass
         
-        # 2. Send the NEW request to all admins
         new_msgs = {}
         for admin in ADMIN_IDS:
             try:
@@ -1107,7 +1152,6 @@ async def request_step3(call: CallbackQuery) -> None:
             except Exception as e:
                 logger.error(f"Failed to send Step 3 request to Admin {admin}: {e}")
                 
-        # 3. Store the new request message IDs in the database for future tracking
         await db.users.update_one({"user_id": user_id}, {"$set": {"pending_step3_msgs": new_msgs}})
         
         await call.message.answer("⏳ Your request for Step 3 has been sent to the admin(s). Please wait for approval.")
@@ -1132,7 +1176,6 @@ async def process_step3(call: CallbackQuery) -> None:
             await call.answer("⚠️ You have already completed Step 3. Button locked.", show_alert=True)
             return
 
-        # Core logic: Pull directly from Dump Channel via msg ID ranges
         stats = await db.settings.find_one({"key": "video_stats"})
         dump_chat_setting = await get_setting("dump_channel")
 
@@ -1151,10 +1194,9 @@ async def process_step3(call: CallbackQuery) -> None:
                 base_msg_id=base_msg_id,
                 total_videos=total_videos,
                 user_sent_batches=user_sent_batches,
-                batches_to_send=2  # Fulfill the TWO batches (12 videos) requirement
+                batches_to_send=2  
             )
             
-            # Save strictly text/metadata (user_sent_batches) back to MongoDB and lock Step 3
             await db.users.update_one(
                 {"user_id": user_id},
                 {
@@ -1166,7 +1208,6 @@ async def process_step3(call: CallbackQuery) -> None:
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="I have done this step", callback_data="req_unlock_4")]
         ])
-        # Voice note will automatically be pushed below the videos in this function
         await send_custom_step_content(call.message.chat.id, "step3", final_markup=keyboard)
         await call.answer()
     except Exception as e:
@@ -1190,18 +1231,15 @@ async def request_step4(call: CallbackQuery) -> None:
         
         admin_msg = f"🔓 <b>Step 4 Unlock Request</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>\n💬 User says: I have done this step."
         
-        # 1. Fetch user data to delete any pending spam requests
         user_data = await get_user(user_id)
         if user_data:
             old_msgs = user_data.get("pending_step4_msgs", {})
-            # Try to delete previous request messages sent to admins
             for adm_id_str, msg_id in old_msgs.items():
                 try:
                     await bot.delete_message(chat_id=int(adm_id_str), message_id=msg_id)
                 except Exception:
                     pass
         
-        # 2. Send the NEW request to all admins
         new_msgs = {}
         for admin in ADMIN_IDS:
             try:
@@ -1210,7 +1248,6 @@ async def request_step4(call: CallbackQuery) -> None:
             except Exception as e:
                 logger.error(f"Failed to send Step 4 request to Admin {admin}: {e}")
                 
-        # 3. Store the new request message IDs in the database for future tracking
         await db.users.update_one({"user_id": user_id}, {"$set": {"pending_step4_msgs": new_msgs}})
         
         await call.message.answer("⏳ Your request for Step 4 has been sent to the admin(s). Please wait for approval.")
@@ -1236,7 +1273,6 @@ async def process_step4(call: CallbackQuery) -> None:
             return
 
         await send_custom_step_content(call.message.chat.id, "step4")
-        # Lock Step 4
         await db.users.update_one({"user_id": user_id}, {"$set": {"step4_used": 1}})
         
         await call.answer()
@@ -1258,17 +1294,14 @@ async def admin_approve_request(call: CallbackQuery) -> None:
             await db.users.update_one({"user_id": target_user_id}, {"$set": {"step4_unlocked": 1}})
             msg_to_user = "✅ Successfully unlocked your Step 4. Please check and run Step 4 from the main menu."
 
-        # Update the message dynamically for ALL admins to show it's approved
         user_data = await get_user(target_user_id)
         pending_msgs = user_data.get(f"pending_step{step}_msgs", {})
         
-        # Remove the tracking since it is now processed
         await db.users.update_one({"user_id": target_user_id}, {"$unset": {f"pending_step{step}_msgs": ""}})
         
         new_text = f"{call.message.html_text}\n\n✅ <b>Approved by Admin {call.from_user.id}</b>"
         
         if not pending_msgs:
-            # Fallback if dictionary was cleared
             await call.message.edit_text(new_text)
         else:
             for adm_id_str, msg_id in pending_msgs.items():
@@ -1293,17 +1326,14 @@ async def admin_deny_request(call: CallbackQuery) -> None:
         step = parts[1]
         target_user_id = int(parts[2])
 
-        # Update the message dynamically for ALL admins to show it's denied
         user_data = await get_user(target_user_id)
         pending_msgs = user_data.get(f"pending_step{step}_msgs", {})
         
-        # Remove the tracking since it is now processed
         await db.users.update_one({"user_id": target_user_id}, {"$unset": {f"pending_step{step}_msgs": ""}})
         
         new_text = f"{call.message.html_text}\n\n❌ <b>Denied by Admin {call.from_user.id}</b>"
         
         if not pending_msgs:
-            # Fallback
             await call.message.edit_text(new_text)
         else:
             for adm_id_str, msg_id in pending_msgs.items():
