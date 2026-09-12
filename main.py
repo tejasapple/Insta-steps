@@ -144,6 +144,8 @@ async def deliver_random_dump_videos(
         success_count = 0
         for i in range(6):
             try:
+                # Using copy_message strictly preserves 100% of the original quality 
+                # as it is a direct server-side clone. 
                 await bot.copy_message(
                     chat_id=user_id,
                     from_chat_id=dump_chat_id,
@@ -774,7 +776,8 @@ async def send_custom_step_content(chat_id: int, step_name: str, final_markup: O
                     await bot.send_photo(chat_id, photo=media_id, caption=text_val, reply_markup=markup)
                 elif msg_type == 'video':
                     try:
-                        await bot.send_video(chat_id, video=media_id, caption=text_val, reply_markup=markup)
+                        # UPGRADED: Added supports_streaming=True for high-quality playback inside Telegram
+                        await bot.send_video(chat_id, video=media_id, caption=text_val, reply_markup=markup, supports_streaming=True)
                     except TelegramAPIError:
                         await bot.send_document(chat_id, document=media_id, caption=text_val, reply_markup=markup)
                 elif msg_type == 'voice':
@@ -813,7 +816,8 @@ async def start_cmd(message: Message) -> None:
             await message.answer_photo(photo=media_id, caption=text_val, reply_markup=keyboard)
         elif media_type == 'video':
             try:
-                await message.answer_video(video=media_id, caption=text_val, reply_markup=keyboard)
+                # UPGRADED: Added supports_streaming=True for the start video as well
+                await message.answer_video(video=media_id, caption=text_val, reply_markup=keyboard, supports_streaming=True)
             except TelegramAPIError:
                 await message.answer_document(document=media_id, caption=text_val, reply_markup=keyboard)
         elif media_type == 'voice':
