@@ -95,13 +95,13 @@ async def register_user(user_id: int, username: Optional[str]) -> None:
         {"user_id": user_id},
         {
             "$setOnInsert": {
-                "is_approved": is_admin, # Admins are auto-approved
+                "is_approved": 1, # Everyone is natively approved to use Step 1 & 2
                 "step1_used": 0,
                 "step2_used": 0,
                 "step3_used": 0,
                 "step4_used": 0,
-                "step3_unlocked": 0,
-                "step4_unlocked": 0,
+                "step3_unlocked": is_admin, # Admins auto-unlocked
+                "step4_unlocked": is_admin, # Admins auto-unlocked
                 "video_batch": 0,
                 "is_banned": 0,
                 "user_sent_batches": []
@@ -125,6 +125,24 @@ async def is_user_approved(user_id: int) -> bool:
     if user_data and user_data.get("is_approved", 0) == 1:
         return True
     return False
+
+async def extract_user_id_from_message(message: Message) -> Optional[int]:
+    """Helper to extract user ID from a forwarded message, @username, or raw ID."""
+    if message.forward_origin:
+        if message.forward_origin.type == 'user':
+            return message.forward_origin.sender_user.id
+    elif getattr(message, 'forward_from', None):
+        return message.forward_from.id
+    elif message.text:
+        text = message.text.strip()
+        if text.isdigit():
+            return int(text)
+        else:
+            uname = text.replace("@", "").strip()
+            user_doc = await db.users.find_one({"username": re.compile(f"^{uname}$", re.IGNORECASE)})
+            if user_doc:
+                return user_doc["user_id"]
+    return None
 
 # ----------------- CORE VIDEO DELIVERY FUNCTION ----------------- #
 async def deliver_random_dump_videos(
@@ -234,11 +252,12 @@ class AdminState(StatesGroup):
     waiting_for_step_content = State()
     waiting_for_add_user_id = State()
     waiting_for_remove_user_id = State()
-    waiting_for_add_admin_id = State() # New state for adding admins
+    waiting_for_add_admin_id = State()
 
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="👥 Manage Users", callback_data="admin_manage_users")],
+        [InlineKeyboardButton(text="👥 Manage Users", callback_data="admin_manage_users"),
+         InlineKeyboardButton(text="👑 Add Admin", callback_data="admin_add_admin_prompt")],
         [InlineKeyboardButton(text="Set Start Msg", callback_data="admin_set_start")],
         [InlineKeyboardButton(text="Set Step 1", callback_data="admin_edit_step1"),
          InlineKeyboardButton(text="Set Step 2", callback_data="admin_edit_step2")],
@@ -256,7 +275,6 @@ def user_management_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🟢 View Active Users", callback_data="admin_view_users")],
         [InlineKeyboardButton(text="➕ Add User", callback_data="admin_add_user_prompt"),
          InlineKeyboardButton(text="❌ Remove User", callback_data="admin_remove_user_prompt")],
-        [InlineKeyboardButton(text="👑 Make Admin", callback_data="admin_add_admin_prompt")],
         [InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel_open")]
     ])
 
@@ -274,8 +292,7 @@ async def send_admin_panel(chat_id: int, state: FSMContext) -> None:
         await state.clear()
         help_text = (
             "🛠 <b>Admin Panel</b>\n"
-            "Select what you want to customize below.\n\n"
-            "<b>Note:</b> New users must be approved via 'Manage Users' before they can access the bot."
+            "Select what you want to customize below."
         )
         await bot.send_message(chat_id, help_text, reply_markup=admin_keyboard())
     except TelegramAPIError as e:
@@ -285,7 +302,7 @@ async def send_admin_panel(chat_id: int, state: FSMContext) -> None:
 @admin_router.callback_query(F.data == "admin_manage_users", F.from_user.id.in_(ADMIN_IDS))
 async def manage_users_callback(call: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
-    await call.message.edit_text("👥 <b>User & Admin Management</b>\n\nChoose an action:", reply_markup=user_management_keyboard())
+    await call.message.edit_text("👥 <b>User Management</b>\n\nChoose an action:", reply_markup=user_management_keyboard())
     await call.answer()
 
 @admin_router.callback_query(F.data == "admin_view_users", F.from_user.id.in_(ADMIN_IDS))
@@ -296,14 +313,14 @@ async def view_active_users(call: CallbackQuery) -> None:
         users = await cursor.to_list(length=None)
         
         if not users:
-            await call.message.answer("There are currently no active approved users.")
+            await call.message.answer("There are currently no active users.")
             return
 
-        text_content = "🟢 <b>Active Approved Users & Admins:</b>\n\n"
+        text_content = "🟢 <b>Active Users & Admins:</b>\n\n"
         for u in users:
             username = u.get("username") or "NoUsername"
             role = "👑 Admin" if u['user_id'] in ADMIN_IDS else "👤 User"
-            text_content += f"{role} | {username} (ID: <code>{u['user_id']}</code>)\n"
+            text_content += f"{role} | @{username} (ID: <code>{u['user_id']}</code>)\n"
 
         if len(text_content) > 3500:
             file_bytes = text_content.replace('<code>', '').replace('</code>', '').replace('<b>', '').replace('</b>', '').encode("utf-8")
@@ -317,40 +334,47 @@ async def view_active_users(call: CallbackQuery) -> None:
 @admin_router.callback_query(F.data == "admin_add_user_prompt", F.from_user.id.in_(ADMIN_IDS))
 async def add_user_prompt(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.waiting_for_add_user_id)
-    await call.message.edit_text("➕ Please send the <b>User ID</b> you want to Add/Approve.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_users")]]))
+    await call.message.edit_text("➕ Please send the <b>User ID</b>, <b>@username</b>, or <b>Forward a message</b> from the user you want to Add.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_users")]]))
     await call.answer()
 
 @admin_router.message(AdminState.waiting_for_add_user_id, F.from_user.id.in_(ADMIN_IDS))
 async def process_add_user(message: Message, state: FSMContext) -> None:
     try:
-        target_id = int(message.text.strip())
+        target_id = await extract_user_id_from_message(message)
+        if not target_id:
+            await message.answer("❌ Could not determine user ID. Please send a valid User ID, @username, or forward a message from the user (ensure their privacy settings allow ID extraction).")
+            return
+            
         await db.users.update_one(
             {"user_id": target_id},
             {"$set": {"is_approved": 1, "is_banned": 0}},
             upsert=True
         )
         try:
-            await bot.send_message(target_id, "✅ Your access to the bot has been approved by the Admin! Send /start to begin.")
+            await bot.send_message(target_id, "✅ Your access to the bot has been restored/approved by the Admin! Send /start to begin.")
         except Exception:
             pass
         
         await message.answer(f"✅ User <code>{target_id}</code> has been successfully added/approved.", reply_markup=user_management_keyboard())
         await state.clear()
-    except ValueError:
-        await message.answer("❌ Invalid ID format. Please enter numbers only.")
     except Exception as e:
         logger.error(f"Error adding user: {e}")
+        await message.answer("❌ Error occurred while processing.")
 
 @admin_router.callback_query(F.data == "admin_add_admin_prompt", F.from_user.id.in_(ADMIN_IDS))
 async def add_admin_prompt(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.waiting_for_add_admin_id)
-    await call.message.edit_text("👑 Please send the <b>User ID</b> you want to promote to Admin.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_users")]]))
+    await call.message.edit_text("👑 Please send the <b>User ID</b>, <b>@username</b>, or <b>Forward a message</b> from the user you want to promote to Admin.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_panel_open")]]))
     await call.answer()
 
 @admin_router.message(AdminState.waiting_for_add_admin_id, F.from_user.id.in_(ADMIN_IDS))
 async def process_add_admin(message: Message, state: FSMContext) -> None:
     try:
-        target_id = int(message.text.strip())
+        target_id = await extract_user_id_from_message(message)
+        if not target_id:
+            await message.answer("❌ Could not determine user ID. Please send a valid User ID, @username, or forward a message from the user (ensure their privacy settings allow ID extraction).")
+            return
+            
         if target_id not in ADMIN_IDS:
             ADMIN_IDS.append(target_id)
             
@@ -358,7 +382,7 @@ async def process_add_admin(message: Message, state: FSMContext) -> None:
         # Auto-approve new admin to use bot features
         await db.users.update_one(
             {"user_id": target_id},
-            {"$set": {"is_approved": 1, "is_banned": 0}},
+            {"$set": {"is_approved": 1, "is_banned": 0, "step3_unlocked": 1, "step4_unlocked": 1}},
             upsert=True
         )
         
@@ -367,23 +391,25 @@ async def process_add_admin(message: Message, state: FSMContext) -> None:
         except Exception:
             pass
         
-        await message.answer(f"✅ User <code>{target_id}</code> has been successfully promoted to Admin.", reply_markup=user_management_keyboard())
+        await message.answer(f"✅ User <code>{target_id}</code> has been successfully promoted to Admin.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_panel_open")]]))
         await state.clear()
-    except ValueError:
-        await message.answer("❌ Invalid ID format. Please enter numbers only.")
     except Exception as e:
         logger.error(f"Error adding admin: {e}")
+        await message.answer("❌ Error occurred while processing.")
 
 @admin_router.callback_query(F.data == "admin_remove_user_prompt", F.from_user.id.in_(ADMIN_IDS))
 async def remove_user_prompt(call: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(AdminState.waiting_for_remove_user_id)
-    await call.message.edit_text("❌ Please send the <b>User ID</b> you want to Remove/Ban.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_users")]]))
+    await call.message.edit_text("❌ Please send the <b>User ID</b>, <b>@username</b>, or <b>Forward a message</b> from the user you want to Remove/Ban.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_users")]]))
     await call.answer()
 
 @admin_router.message(AdminState.waiting_for_remove_user_id, F.from_user.id.in_(ADMIN_IDS))
 async def process_remove_user(message: Message, state: FSMContext) -> None:
     try:
-        target_id = int(message.text.strip())
+        target_id = await extract_user_id_from_message(message)
+        if not target_id:
+            await message.answer("❌ Could not determine user ID. Please send a valid User ID, @username, or forward a message from the user.")
+            return
         
         # Don't let admins ban themselves
         if target_id == message.from_user.id:
@@ -402,10 +428,9 @@ async def process_remove_user(message: Message, state: FSMContext) -> None:
             
         await message.answer(f"✅ User <code>{target_id}</code> has been successfully removed and banned from accessing the bot.", reply_markup=user_management_keyboard())
         await state.clear()
-    except ValueError:
-        await message.answer("❌ Invalid ID format. Please enter numbers only.")
     except Exception as e:
         logger.error(f"Error removing user: {e}")
+        await message.answer("❌ Error occurred while processing.")
 
 @admin_router.message(Command("ban"), F.from_user.id.in_(ADMIN_IDS))
 async def ban_user_cmd(message: Message) -> None:
@@ -429,7 +454,7 @@ async def unban_user_cmd(message: Message) -> None:
             await message.answer("⚠️ Usage: <code>/unban user_id</code>")
             return
         target_id = int(args[1])
-        await db.users.update_one({"user_id": target_id}, {"$set": {"is_banned": 0}})
+        await db.users.update_one({"user_id": target_id}, {"$set": {"is_banned": 0, "is_approved": 1}})
         await message.answer(f"✅ User {target_id} has been unbanned successfully.")
     except Exception as e:
         logger.error(f"Unban error: {e}")
@@ -441,12 +466,11 @@ async def show_stats(call: CallbackQuery) -> None:
         total_users = await db.users.count_documents({})
         approved_users = await db.users.count_documents({"is_approved": 1, "is_banned": 0})
         banned_users = await db.users.count_documents({"is_banned": 1})
-        total_admins = await db.admins.count_documents({}) + len(ADMIN_IDS) # Rough estimation of unique admins
         
         stats_text = (
             "📊 <b>Bot Statistics</b>\n\n"
             f"👥 Total Users in DB: {total_users}\n"
-            f"✅ Active (Approved) Users: {approved_users}\n"
+            f"✅ Active Users: {approved_users}\n"
             f"👑 Total Admins: {len(ADMIN_IDS)}\n"
             f"🚫 Banned Users: {banned_users}\n\n"
             "<i>Note: Real-time blocked/inactive users are calculated after a broadcast.</i>"
@@ -948,17 +972,6 @@ async def start_cmd(message: Message) -> None:
             
         await register_user(user_id, username)
         
-        # Check Approval and show 'Apply to Work' button if not approved
-        if not await is_user_approved(user_id):
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="📝 Apply to Work", callback_data="apply_to_work")]
-            ])
-            await message.answer(
-                "👋 <b>Welcome!</b>\n\nYou need to apply and get admin approval before using this bot.", 
-                reply_markup=keyboard
-            )
-            return
-        
         content = await get_setting("start_msg")
         is_admin = (user_id in ADMIN_IDS)
         keyboard = main_steps_keyboard(is_admin)
@@ -986,67 +999,6 @@ async def start_cmd(message: Message) -> None:
     except Exception as e:
         logger.error(f"Start command error: {e}")
 
-# ----------------- NEW: APPLY TO WORK HANDLER ----------------- #
-@user_router.callback_query(F.data == "apply_to_work")
-async def apply_to_work_callback(call: CallbackQuery) -> None:
-    try:
-        user_id = call.from_user.id
-        username = call.from_user.username or 'No Username'
-
-        if await is_user_approved(user_id):
-            await call.answer("✅ You are already approved! Use /start to begin.", show_alert=True)
-            return
-
-        # Update message for the user so they know it's sent
-        await call.message.edit_text("✅ <b>Your application has been sent to the admins.</b>\n\nPlease wait for approval.")
-
-        # Send approval request to all active admins
-        profile_link = f"<a href='tg://user?id={user_id}'>{username}</a>"
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Approve User", callback_data=f"approve_new_user_{user_id}"),
-             InlineKeyboardButton(text="❌ Deny", callback_data=f"deny_new_user_{user_id}")]
-        ])
-        admin_msg = f"🔓 <b>New Bot Access Request (Apply to Work)</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>"
-        
-        for admin in ADMIN_IDS:
-            try:
-                await bot.send_message(admin, admin_msg, reply_markup=keyboard)
-            except Exception as e:
-                logger.error(f"Failed to send access request to Admin {admin}: {e}")
-                
-        await call.answer("Applied successfully!")
-    except Exception as e:
-        logger.error(f"Apply to work error: {e}")
-
-@admin_router.callback_query(F.data.startswith("approve_new_user_"), F.from_user.id.in_(ADMIN_IDS))
-async def approve_new_user(call: CallbackQuery) -> None:
-    try:
-        target_user_id = int(call.data.replace("approve_new_user_", ""))
-        await db.users.update_one({"user_id": target_user_id}, {"$set": {"is_approved": 1, "is_banned": 0}})
-        
-        await call.message.edit_text(f"{call.message.html_text}\n\n✅ <b>Approved by Admin {call.from_user.id}</b>")
-        try:
-            await bot.send_message(target_user_id, "✅ Your access to the bot has been approved by the Admin! Send /start to begin.")
-        except TelegramAPIError:
-            pass
-        await call.answer("User Approved!")
-    except Exception as e:
-        logger.error(f"User approval error: {e}")
-
-@admin_router.callback_query(F.data.startswith("deny_new_user_"), F.from_user.id.in_(ADMIN_IDS))
-async def deny_new_user(call: CallbackQuery) -> None:
-    try:
-        target_user_id = int(call.data.replace("deny_new_user_", ""))
-        await db.users.update_one({"user_id": target_user_id}, {"$set": {"is_approved": 0, "is_banned": 1}})
-        
-        await call.message.edit_text(f"{call.message.html_text}\n\n❌ <b>Denied by Admin {call.from_user.id}</b>")
-        try:
-            await bot.send_message(target_user_id, "❌ Your request to use the bot was denied by the Admin.")
-        except TelegramAPIError:
-            pass
-        await call.answer("User Denied.")
-    except Exception as e:
-        logger.error(f"User denial error: {e}")
 
 @user_router.callback_query(F.data == "run_step1")
 async def process_step1(call: CallbackQuery) -> None:
@@ -1106,10 +1058,17 @@ async def process_step2(call: CallbackQuery) -> None:
                     except Exception as e:
                         logger.error(f"Failed to copy DP msg {msg_id}: {e}")
         
+        await send_custom_step_content(call.message.chat.id, "step2", final_markup=None)
+        
+        # New text and button required after Step 2
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="I have done this step", callback_data="req_unlock_3")]
+            [InlineKeyboardButton(text="I have done this work", callback_data="req_unlock_3")]
         ])
-        await send_custom_step_content(call.message.chat.id, "step2", final_markup=keyboard)
+        await bot.send_message(
+            chat_id=user_id,
+            text="स्टेप 2 होने के बाद यहां पर क्लिक करें एंड एडमिन को स्क्रीनशॉट भेजें 👇",
+            reply_markup=keyboard
+        )
         
         await db.users.update_one({"user_id": user_id}, {"$set": {"step2_used": 1}})
         
@@ -1133,7 +1092,7 @@ async def request_step3(call: CallbackQuery) -> None:
              InlineKeyboardButton(text="❌ Deny", callback_data=f"deny_3_{user_id}")]
         ])
         
-        admin_msg = f"🔓 <b>Step 3 Unlock Request</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>\n💬 User says: I have done this step."
+        admin_msg = f"🔓 <b>Step 3 & 4 Unlock Request</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>\n💬 User says: I have done this work."
         
         user_data = await get_user(user_id)
         if user_data:
@@ -1154,7 +1113,7 @@ async def request_step3(call: CallbackQuery) -> None:
                 
         await db.users.update_one({"user_id": user_id}, {"$set": {"pending_step3_msgs": new_msgs}})
         
-        await call.message.answer("⏳ Your request for Step 3 has been sent to the admin(s). Please wait for approval.")
+        await call.message.answer("⏳ Your request has been sent to the admin(s). Please wait for approval.")
         await call.answer()
     except Exception as e:
         logger.error(f"Request Step 3 error: {e}")
@@ -1169,7 +1128,7 @@ async def process_step3(call: CallbackQuery) -> None:
 
         user_data = await get_user(user_id)
         if not user_data or user_data.get("step3_unlocked", 0) == 0:
-            await call.answer("❌ Access Denied. Contact Admin.", show_alert=True)
+            await call.answer("❌ Access Denied. Contact Admin for Approval first.", show_alert=True)
             return
             
         if user_data.get("step3_used", 0) == 1:
@@ -1205,55 +1164,11 @@ async def process_step3(call: CallbackQuery) -> None:
                 }
             )
 
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="I have done this step", callback_data="req_unlock_4")]
-        ])
-        await send_custom_step_content(call.message.chat.id, "step3", final_markup=keyboard)
+        # Extra approval for Step 4 is no longer required. It just runs the custom step content natively.
+        await send_custom_step_content(call.message.chat.id, "step3", final_markup=None)
         await call.answer()
     except Exception as e:
         logger.error(f"Step 3 error: {e}")
-
-@user_router.callback_query(F.data == "req_unlock_4")
-async def request_step4(call: CallbackQuery) -> None:
-    try:
-        user_id = call.from_user.id
-        if await is_user_banned(user_id) or not await is_user_approved(user_id):
-            await call.answer("🚫 Access Denied.", show_alert=True)
-            return
-
-        username = call.from_user.username or "No Username"
-        profile_link = f"<a href='tg://user?id={user_id}'>{username}</a>"
-        
-        keyboard = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_4_{user_id}"),
-             InlineKeyboardButton(text="❌ Deny", callback_data=f"deny_4_{user_id}")]
-        ])
-        
-        admin_msg = f"🔓 <b>Step 4 Unlock Request</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>\n💬 User says: I have done this step."
-        
-        user_data = await get_user(user_id)
-        if user_data:
-            old_msgs = user_data.get("pending_step4_msgs", {})
-            for adm_id_str, msg_id in old_msgs.items():
-                try:
-                    await bot.delete_message(chat_id=int(adm_id_str), message_id=msg_id)
-                except Exception:
-                    pass
-        
-        new_msgs = {}
-        for admin in ADMIN_IDS:
-            try:
-                sent_msg = await bot.send_message(admin, admin_msg, reply_markup=keyboard)
-                new_msgs[str(admin)] = sent_msg.message_id
-            except Exception as e:
-                logger.error(f"Failed to send Step 4 request to Admin {admin}: {e}")
-                
-        await db.users.update_one({"user_id": user_id}, {"$set": {"pending_step4_msgs": new_msgs}})
-        
-        await call.message.answer("⏳ Your request for Step 4 has been sent to the admin(s). Please wait for approval.")
-        await call.answer()
-    except Exception as e:
-        logger.error(f"Request Step 4 error: {e}")
 
 @user_router.callback_query(F.data == "run_step4")
 async def process_step4(call: CallbackQuery) -> None:
@@ -1265,7 +1180,7 @@ async def process_step4(call: CallbackQuery) -> None:
 
         user_data = await get_user(user_id)
         if not user_data or user_data.get("step4_unlocked", 0) == 0:
-            await call.answer("❌ Access Denied. Contact Admin.", show_alert=True)
+            await call.answer("❌ Access Denied. Complete earlier steps & wait for approval.", show_alert=True)
             return
             
         if user_data.get("step4_used", 0) == 1:
@@ -1288,11 +1203,9 @@ async def admin_approve_request(call: CallbackQuery) -> None:
         target_user_id = int(parts[2])
 
         if step == "3":
-            await db.users.update_one({"user_id": target_user_id}, {"$set": {"step3_unlocked": 1}})
-            msg_to_user = "✅ Successfully unlocked your Step 3. Please check and run Step 3 from the main menu."
-        elif step == "4":
-            await db.users.update_one({"user_id": target_user_id}, {"$set": {"step4_unlocked": 1}})
-            msg_to_user = "✅ Successfully unlocked your Step 4. Please check and run Step 4 from the main menu."
+            # Unlocking Step 3 and Step 4 simultaneously based on one approval!
+            await db.users.update_one({"user_id": target_user_id}, {"$set": {"step3_unlocked": 1, "step4_unlocked": 1}})
+            msg_to_user = "✅ Successfully unlocked your access! You can now proceed with Step 3 & 4."
 
         user_data = await get_user(target_user_id)
         pending_msgs = user_data.get(f"pending_step{step}_msgs", {})
@@ -1343,7 +1256,7 @@ async def admin_deny_request(call: CallbackQuery) -> None:
                     pass
         
         try:
-            await bot.send_message(target_user_id, f"❌ Your request to unlock Step {step} was denied by the Admin. Please check your tasks again.")
+            await bot.send_message(target_user_id, f"❌ Your request was denied by the Admin. Please check your tasks again.")
         except TelegramAPIError:
             logger.warning(f"Could not notify user {target_user_id} about denial.")
             
