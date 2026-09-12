@@ -10,20 +10,22 @@ from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, 
-    InlineKeyboardButton, InputMediaVideo, InputMediaPhoto
+    InlineKeyboardButton
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.exceptions import TelegramAPIError
-import aiosqlite
+
+import motor.motor_asyncio
 
 # ----------------- CONFIGURATION ----------------- #
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+MONGO_URI = os.getenv("MONGO_URI")
 
-if not BOT_TOKEN or not ADMIN_ID:
-    raise ValueError("Bhai, .env file mein BOT_TOKEN aur ADMIN_ID set karna zaruri hai!")
+if not BOT_TOKEN or not ADMIN_ID or not MONGO_URI:
+    raise ValueError("Bhai, .env file mein BOT_TOKEN, ADMIN_ID aur MONGO_URI set karna zaruri hai!")
 
 # Setup robust logging
 logging.basicConfig(
@@ -45,105 +47,108 @@ dp.include_router(user_router)
 dp.include_router(admin_router)
 dp.include_router(channel_router)
 
-# Database path
-DB_PATH = "bot_database.sqlite"
-
 # ----------------- DATABASE SETUP ----------------- #
+mongo_client = motor.motor_asyncio.AsyncIOMotorClient(MONGO_URI)
+db = mongo_client["telegram_bot_db"]
+
 async def init_db() -> None:
-    """Initialize the async SQLite database and required tables."""
+    """Initialize the async MongoDB database and required indexes."""
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            # Table for Users
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id INTEGER PRIMARY KEY,
-                    username TEXT,
-                    step3_unlocked INTEGER DEFAULT 0,
-                    step4_unlocked INTEGER DEFAULT 0,
-                    video_batch INTEGER DEFAULT 0,
-                    is_banned INTEGER DEFAULT 0
-                )
-            """)
-            
-            # Safe migration for existing databases
-            try:
-                await db.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
-            except Exception:
-                pass 
-            
-            # Legacy Table for single Settings (like Start msg, DP channel, Dump channel)
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS settings (
-                    key TEXT PRIMARY KEY,
-                    text_val TEXT,
-                    media_id TEXT,
-                    media_type TEXT
-                )
-            """)
-            
-            # NEW Table for Multi-message Step configuration
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS step_messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    step_name TEXT,
-                    msg_type TEXT,
-                    media_id TEXT,
-                    text_val TEXT,
-                    order_index INTEGER
-                )
-            """)
-            
-            # DP Bank Table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS dp_bank (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    file_id TEXT
-                )
-            """)
-            # Video Dump Table
-            await db.execute("""
-                CREATE TABLE IF NOT EXISTS video_dump (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    file_id TEXT
-                )
-            """)
-            await db.commit()
-            logger.info("Database initialized successfully.")
+        # Create unique index for users to prevent duplicates
+        await db.users.create_index("user_id", unique=True)
+        await db.settings.create_index("key", unique=True)
+        logger.info("MongoDB initialized successfully.")
     except Exception as e:
         logger.error(f"Failed to initialize database: {e}")
 
 # Database Helper Functions
 async def set_setting(key: str, text_val: str, media_id: Optional[str] = None, media_type: Optional[str] = None) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
-            "INSERT INTO settings (key, text_val, media_id, media_type) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET text_val=excluded.text_val, media_id=excluded.media_id, media_type=excluded.media_type",
-            (key, text_val, media_id, media_type)
-        )
-        await db.commit()
+    await db.settings.update_one(
+        {"key": key},
+        {"$set": {"text_val": text_val, "media_id": media_id, "media_type": media_type}},
+        upsert=True
+    )
 
 async def get_setting(key: str) -> Optional[Tuple[str, Optional[str], Optional[str]]]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT text_val, media_id, media_type FROM settings WHERE key = ?", (key,)) as cursor:
-            row = await cursor.fetchone()
-            return row if row else None
+    doc = await db.settings.find_one({"key": key})
+    if doc:
+        return (doc.get("text_val", ""), doc.get("media_id"), doc.get("media_type"))
+    return None
 
 async def register_user(user_id: int, username: Optional[str]) -> None:
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT OR IGNORE INTO users (user_id, username, is_banned) VALUES (?, ?, 0)", (user_id, username))
-        await db.execute("UPDATE users SET username = ? WHERE user_id = ?", (username, user_id))
-        await db.commit()
+    await db.users.update_one(
+        {"user_id": user_id},
+        {
+            "$setOnInsert": {
+                "step3_unlocked": 0,
+                "step4_unlocked": 0,
+                "video_batch": 0,
+                "is_banned": 0,
+                "user_sent_batches": []
+            },
+            "$set": {"username": username}
+        },
+        upsert=True
+    )
 
-async def get_user(user_id: int) -> Optional[Tuple[int, int, int, int]]:
-    async with aiosqlite.connect(DB_PATH) as db:
-        async with db.execute("SELECT step3_unlocked, step4_unlocked, video_batch, is_banned FROM users WHERE user_id = ?", (user_id,)) as cursor:
-            return await cursor.fetchone()
+async def get_user(user_id: int) -> Optional[dict]:
+    return await db.users.find_one({"user_id": user_id})
 
 async def is_user_banned(user_id: int) -> bool:
     user_data = await get_user(user_id)
-    if user_data and len(user_data) >= 4 and user_data[3] == 1:
+    if user_data and user_data.get("is_banned", 0) == 1:
         return True
     return False
+
+# ----------------- CORE VIDEO DELIVERY FUNCTION ----------------- #
+async def deliver_random_dump_videos(
+    bot: Bot, 
+    user_id: int, 
+    dump_chat_id: int, 
+    base_msg_id: int, 
+    total_videos: int, 
+    user_sent_batches: list,
+    batches_to_send: int = 1
+) -> list:
+    """
+    Core method to fetch random unique videos from a dump channel.
+    Returns the updated list of sent_batches for the user so you can save it to MongoDB.
+    """
+    # 1. Total available chunks of 6 videos
+    total_batches_available = total_videos // 6
+    
+    # 2. Filter out batches the user has already received
+    available_batches = [i for i in range(total_batches_available) if i not in user_sent_batches]
+    
+    # Check if we have enough unique batches left
+    if len(available_batches) < batches_to_send:
+        logger.warning(f"Not enough unique videos left for user {user_id}")
+        return user_sent_batches # Return unchanged
+
+    # 3. Randomly select the required number of batches
+    selected_batches = random.sample(available_batches, batches_to_send)
+    
+    # 4. Extract and copy messages from the Dump Channel
+    for batch_idx in selected_batches:
+        start_msg_id = base_msg_id + (batch_idx * 6)
+        
+        success_count = 0
+        for i in range(6):
+            try:
+                await bot.copy_message(
+                    chat_id=user_id,
+                    from_chat_id=dump_chat_id,
+                    message_id=start_msg_id + i
+                )
+                success_count += 1
+                await asyncio.sleep(0.3) # Anti-flood delay
+            except Exception as e:
+                logger.error(f"Failed to copy msg {start_msg_id + i} to {user_id}: {e}")
+                
+        if success_count > 0:
+            user_sent_batches.append(batch_idx)
+            
+    return user_sent_batches
 
 # ----------------- ADMIN STATES & HANDLERS ----------------- #
 class AdminState(StatesGroup):
@@ -197,9 +202,7 @@ async def ban_user_cmd(message: Message) -> None:
             await message.answer("⚠️ Usage: <code>/ban user_id</code>")
             return
         target_id = int(args[1])
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET is_banned = 1 WHERE user_id = ?", (target_id,))
-            await db.commit()
+        await db.users.update_one({"user_id": target_id}, {"$set": {"is_banned": 1}})
         await message.answer(f"✅ User {target_id} has been permanently banned from using the bot.")
     except Exception as e:
         logger.error(f"Ban error: {e}")
@@ -213,9 +216,7 @@ async def unban_user_cmd(message: Message) -> None:
             await message.answer("⚠️ Usage: <code>/unban user_id</code>")
             return
         target_id = int(args[1])
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET is_banned = 0 WHERE user_id = ?", (target_id,))
-            await db.commit()
+        await db.users.update_one({"user_id": target_id}, {"$set": {"is_banned": 0}})
         await message.answer(f"✅ User {target_id} has been unbanned successfully.")
     except Exception as e:
         logger.error(f"Unban error: {e}")
@@ -224,11 +225,8 @@ async def unban_user_cmd(message: Message) -> None:
 @admin_router.callback_query(F.data == "admin_stats", F.from_user.id == ADMIN_ID)
 async def show_stats(call: CallbackQuery) -> None:
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT COUNT(*) FROM users") as cursor:
-                total_users = (await cursor.fetchone())[0]
-            async with db.execute("SELECT COUNT(*) FROM users WHERE is_banned = 1") as cursor:
-                banned_users = (await cursor.fetchone())[0]
+        total_users = await db.users.count_documents({})
+        banned_users = await db.users.count_documents({"is_banned": 1})
         
         stats_text = (
             "📊 <b>Bot Statistics</b>\n\n"
@@ -260,11 +258,8 @@ async def execute_broadcast(message: Message, state: FSMContext) -> None:
         success = 0
         failed = 0
         
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT user_id FROM users WHERE is_banned = 0") as cursor:
-                users = await cursor.fetchall()
-                
-        for (uid,) in users:
+        async for user_doc in db.users.find({"is_banned": 0}):
+            uid = user_doc["user_id"]
             try:
                 await bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.message_id)
                 success += 1
@@ -289,15 +284,16 @@ async def admin_edit_step(call: CallbackQuery, state: FSMContext) -> None:
         step_name = call.data.replace("admin_edit_", "")
         await state.update_data(current_step=step_name)
         
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT msg_type, text_val FROM step_messages WHERE step_name = ? ORDER BY order_index ASC", (step_name,)) as cursor:
-                messages = await cursor.fetchall()
+        cursor = db.step_messages.find({"step_name": step_name}).sort("order_index", 1)
+        messages = await cursor.to_list(length=None)
         
         parts_text = f"🛠 <b>Editing {step_name.upper()}</b>\n\nCurrent Assigned Messages:\n"
         if not messages:
             parts_text += "<i>No messages configured yet.</i>\n"
         else:
-            for i, (m_type, txt) in enumerate(messages, 1):
+            for i, msg in enumerate(messages, 1):
+                m_type = msg.get("msg_type", "text")
+                txt = msg.get("text_val", "")
                 preview = txt[:25] + "..." if txt and len(txt) > 25 else (txt or "No Caption/Text")
                 parts_text += f"{i}. <b>[{m_type.upper()}]</b> - {preview}\n"
                 
@@ -363,13 +359,16 @@ async def save_step_part(message: Message, state: FSMContext) -> None:
             await message.answer(f"⚠️ Invalid format! I am expecting a <b>{expected_type.upper()}</b>. Please try again.")
             return
             
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT MAX(order_index) FROM step_messages WHERE step_name = ?", (step_name,)) as cursor:
-                res = await cursor.fetchone()
-                order_index = (res[0] or 0) + 1
-            await db.execute("INSERT INTO step_messages (step_name, msg_type, media_id, text_val, order_index) VALUES (?, ?, ?, ?, ?)",
-                             (step_name, msg_type, media_id, text_val, order_index))
-            await db.commit()
+        last_doc = await db.step_messages.find_one({"step_name": step_name}, sort=[("order_index", -1)])
+        order_index = (last_doc["order_index"] + 1) if last_doc else 1
+        
+        await db.step_messages.insert_one({
+            "step_name": step_name, 
+            "msg_type": msg_type, 
+            "media_id": media_id, 
+            "text_val": text_val, 
+            "order_index": order_index
+        })
             
         success_keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text=f"🔙 Go Back to {step_name.upper()}", callback_data=f"admin_edit_{step_name}")]
@@ -385,9 +384,7 @@ async def clear_step_parts(call: CallbackQuery, state: FSMContext) -> None:
         data = await state.get_data()
         step_name = data.get("current_step")
         if step_name:
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("DELETE FROM step_messages WHERE step_name = ?", (step_name,))
-                await db.commit()
+            await db.step_messages.delete_many({"step_name": step_name})
             
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [InlineKeyboardButton(text=f"🔙 Go Back to {step_name.upper()}", callback_data=f"admin_edit_{step_name}")]
@@ -452,8 +449,9 @@ async def save_start(msg: Message, state: FSMContext) -> None:
 async def save_dp_channel(message: Message, state: FSMContext) -> None:
     try:
         await set_setting("dp_channel", message.text.strip())
+        await db.settings.delete_one({"key": "dp_stats"}) # Reset stats on new channel
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel_open")]])
-        await message.answer("✅ DP Channel/Group ID saved! Bot will now auto-save any photos posted there.", reply_markup=keyboard)
+        await message.answer("✅ DP Channel/Group ID saved! Forward DPs to track them without saving files to DB.", reply_markup=keyboard)
         await state.clear()
     except Exception as e:
         logger.error(f"Error saving DP channel: {e}")
@@ -462,35 +460,47 @@ async def save_dp_channel(message: Message, state: FSMContext) -> None:
 async def save_dump_channel(message: Message, state: FSMContext) -> None:
     try:
         await set_setting("dump_channel", message.text.strip())
+        await db.settings.delete_one({"key": "video_stats"}) # Reset stats on new channel
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel_open")]])
-        await message.answer("✅ Video Dump Channel/Group ID saved! Bot will now auto-save any videos posted there.", reply_markup=keyboard)
+        await message.answer("✅ Video Dump Channel/Group ID saved! Forward videos to track them without saving files to DB.", reply_markup=keyboard)
         await state.clear()
     except Exception as e:
         logger.error(f"Error saving Dump channel: {e}")
 
-# ----------------- CHANNEL LISTENER (AUTO SAVE TO BANK) ----------------- #
-# Fix: Using both message and channel_post to support Groups AND Channels respectively
+# ----------------- CHANNEL LISTENER (AUTO TRACK METADATA ONLY) ----------------- #
 @channel_router.message(F.photo | F.video)
 @channel_router.channel_post(F.photo | F.video)
 async def listen_channels(message: Message) -> None:
+    """
+    Keeps photos/videos OUT of MongoDB. 
+    Only records the base_msg_id (lowest msg id) and total count.
+    """
     try:
         dp_setting = await get_setting("dp_channel")
         dump_setting = await get_setting("dump_channel")
         chat_id = str(message.chat.id)
 
         if dp_setting and chat_id == dp_setting[0] and message.photo:
-            file_id = message.photo[-1].file_id
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("INSERT INTO dp_bank (file_id) VALUES (?)", (file_id,))
-                await db.commit()
-            logger.info("Saved new DP to DP Bank.")
+            await db.settings.update_one(
+                {"key": "dp_stats"},
+                {
+                    "$inc": {"total": 1}, 
+                    "$min": {"base_msg_id": message.message_id}
+                },
+                upsert=True
+            )
+            logger.info("Tracked new DP metadata. No media saved in DB.")
         
         if dump_setting and chat_id == dump_setting[0] and message.video:
-            file_id = message.video.file_id
-            async with aiosqlite.connect(DB_PATH) as db:
-                await db.execute("INSERT INTO video_dump (file_id) VALUES (?)", (file_id,))
-                await db.commit()
-            logger.info("Saved new Video to Video Dump.")
+            await db.settings.update_one(
+                {"key": "video_stats"},
+                {
+                    "$inc": {"total": 1}, 
+                    "$min": {"base_msg_id": message.message_id}
+                },
+                upsert=True
+            )
+            logger.info("Tracked new Video metadata. No media saved in DB.")
     except Exception as e:
         logger.error(f"Error in channel listener: {e}")
 
@@ -508,15 +518,17 @@ def main_steps_keyboard(is_admin: bool = False) -> InlineKeyboardMarkup:
 
 async def send_custom_step_content(chat_id: int, step_name: str, final_markup: Optional[InlineKeyboardMarkup] = None) -> None:
     try:
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT msg_type, media_id, text_val FROM step_messages WHERE step_name = ? ORDER BY order_index ASC", (step_name,)) as cursor:
-                messages = await cursor.fetchall()
+        cursor = db.step_messages.find({"step_name": step_name}).sort("order_index", 1)
+        messages = await cursor.to_list(length=None)
         
         if not messages:
             await bot.send_message(chat_id, f"⚠️ Admin hasn't set any messages for {step_name.title()} yet.", reply_markup=final_markup)
             return
 
-        for i, (msg_type, media_id, text_val) in enumerate(messages):
+        for i, msg in enumerate(messages):
+            msg_type = msg.get("msg_type")
+            media_id = msg.get("media_id")
+            text_val = msg.get("text_val", "")
             markup = final_markup if i == len(messages) - 1 else None
             
             try:
@@ -584,23 +596,30 @@ async def process_step2(call: CallbackQuery) -> None:
             await call.answer("🚫 You are banned from using this bot.", show_alert=True)
             return
 
-        # Fetch 2 random DPs from DP bank
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT file_id FROM dp_bank ORDER BY RANDOM() LIMIT 2") as cursor:
-                dps = await cursor.fetchall()
+        stats = await db.settings.find_one({"key": "dp_stats"})
+        dp_chat_setting = await get_setting("dp_channel")
         
-        if not dps:
-            await call.message.answer("📭 No DPs available in the bank right now. Please check if ID is correct and DPs have been sent to the group.")
+        if not stats or not dp_chat_setting:
+            await call.message.answer("📭 No DPs available. Please ensure DP Channel is setup and DPs are posted.")
         else:
-            try:
-                # Fix: Handle empty array crash gracefully, sends up to 2 items
-                if len(dps) == 1:
-                    await bot.send_photo(call.message.chat.id, photo=dps[0][0])
-                elif len(dps) >= 2:
-                    media_group = [InputMediaPhoto(media=dp[0]) for dp in dps]
-                    await bot.send_media_group(call.message.chat.id, media=media_group)
-            except TelegramAPIError as e:
-                logger.error(f"Failed to send DPs in Step 2: {e}")
+            base_msg_id = stats.get("base_msg_id", 0)
+            total = stats.get("total", 0)
+            dp_chat_id = int(dp_chat_setting[0])
+            
+            if total > 0:
+                count_to_send = min(2, total)
+                selected_offsets = random.sample(range(total), count_to_send)
+                for offset in selected_offsets:
+                    msg_id = base_msg_id + offset
+                    try:
+                        await bot.copy_message(
+                            chat_id=call.from_user.id,
+                            from_chat_id=dp_chat_id,
+                            message_id=msg_id
+                        )
+                        await asyncio.sleep(0.3)
+                    except Exception as e:
+                        logger.error(f"Failed to copy DP msg {msg_id}: {e}")
         
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="I have done this step", callback_data="req_unlock_3")]
@@ -642,51 +661,38 @@ async def process_step3(call: CallbackQuery) -> None:
             return
 
         user_data = await get_user(call.from_user.id)
-        if not user_data or user_data[0] == 0:
+        if not user_data or user_data.get("step3_unlocked", 0) == 0:
             await call.answer("❌ Access Denied. Contact Admin.", show_alert=True)
             return
 
-        # Fetch up to 12 Random videos for sending TWO batches at once (Batch limit restriction removed for "har bar" requirement)
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT file_id FROM video_dump ORDER BY RANDOM() LIMIT 12") as cursor:
-                videos = await cursor.fetchall()
+        # Core logic: Pull directly from Dump Channel via msg ID ranges
+        stats = await db.settings.find_one({"key": "video_stats"})
+        dump_chat_setting = await get_setting("dump_channel")
 
-        if not videos:
-            await call.message.answer("📭 No more videos available in the bank right now. Group me nayi videos send karo.")
+        if not stats or not dump_chat_setting:
+            await call.message.answer("📭 Video dump is not configured or empty. Group me nayi videos send karo.")
         else:
-            # Divide into Batch 1 and Batch 2
-            batch1 = videos[:6]
-            batch2 = videos[6:12]
+            base_msg_id = stats.get("base_msg_id", 0)
+            total_videos = stats.get("total", 0)
+            dump_chat_id = int(dump_chat_setting[0])
+            user_sent_batches = user_data.get("user_sent_batches", [])
 
-            try:
-                # Send Batch 1
-                if batch1:
-                    if len(batch1) == 1:
-                        await bot.send_video(call.message.chat.id, video=batch1[0][0])
-                    else:
-                        media_group1 = [InputMediaVideo(media=vid[0]) for vid in batch1]
-                        await bot.send_media_group(call.message.chat.id, media=media_group1)
-                
-                # Increased delay to prevent Telegram FloodWait API error between sending large media chunks
-                if batch2:
-                    await asyncio.sleep(1.5)
-                    
-                    # Send Batch 2
-                    if len(batch2) == 1:
-                        await bot.send_video(call.message.chat.id, video=batch2[0][0])
-                    else:
-                        media_group2 = [InputMediaVideo(media=vid[0]) for vid in batch2]
-                        await bot.send_media_group(call.message.chat.id, media=media_group2)
-                
-                # Keep tracking counter safely for stats without limiting user usage anymore
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("UPDATE users SET video_batch = video_batch + 2 WHERE user_id = ?", (call.from_user.id,))
-                    await db.commit()
+            updated_batches = await deliver_random_dump_videos(
+                bot=bot,
+                user_id=call.from_user.id,
+                dump_chat_id=dump_chat_id,
+                base_msg_id=base_msg_id,
+                total_videos=total_videos,
+                user_sent_batches=user_sent_batches,
+                batches_to_send=2  # Fulfill the TWO batches requirement from old code
+            )
+            
+            # Save strictly text/metadata (user_sent_batches) back to MongoDB
+            await db.users.update_one(
+                {"user_id": call.from_user.id},
+                {"$set": {"user_sent_batches": updated_batches}, "$inc": {"video_batch": 2}}
+            )
 
-            except TelegramAPIError as e:
-                logger.error(f"Failed to send video batches in Step 3: {e}")
-
-        # Send Multi-message Step 3 content with Unlock Step 4 button at the very end
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="I have done this step", callback_data="req_unlock_4")]
         ])
@@ -727,7 +733,7 @@ async def process_step4(call: CallbackQuery) -> None:
             return
 
         user_data = await get_user(call.from_user.id)
-        if not user_data or user_data[1] == 0:
+        if not user_data or user_data.get("step4_unlocked", 0) == 0:
             await call.answer("❌ Access Denied. Contact Admin.", show_alert=True)
             return
 
@@ -744,14 +750,12 @@ async def admin_approve_request(call: CallbackQuery) -> None:
         step = parts[1]
         target_user_id = int(parts[2])
 
-        async with aiosqlite.connect(DB_PATH) as db:
-            if step == "3":
-                await db.execute("UPDATE users SET step3_unlocked = 1 WHERE user_id = ?", (target_user_id,))
-                msg_to_user = "✅ Successfully unlocked your Step 3. Please check and run Step 3 from the main menu."
-            elif step == "4":
-                await db.execute("UPDATE users SET step4_unlocked = 1 WHERE user_id = ?", (target_user_id,))
-                msg_to_user = "✅ Successfully unlocked your Step 4. Please check and run Step 4 from the main menu."
-            await db.commit()
+        if step == "3":
+            await db.users.update_one({"user_id": target_user_id}, {"$set": {"step3_unlocked": 1}})
+            msg_to_user = "✅ Successfully unlocked your Step 3. Please check and run Step 3 from the main menu."
+        elif step == "4":
+            await db.users.update_one({"user_id": target_user_id}, {"$set": {"step4_unlocked": 1}})
+            msg_to_user = "✅ Successfully unlocked your Step 4. Please check and run Step 4 from the main menu."
 
         await call.message.edit_text(f"{call.message.html_text}\n\n✅ <b>Approved Successfully</b>")
         
