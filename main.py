@@ -151,7 +151,6 @@ class AdminState(StatesGroup):
     waiting_for_dp_channel = State()
     waiting_for_dump_channel = State()
     waiting_for_broadcast = State()
-    # New Multi-message setup states
     waiting_for_step_content = State()
 
 def admin_keyboard() -> InlineKeyboardMarkup:
@@ -376,7 +375,7 @@ async def save_step_part(message: Message, state: FSMContext) -> None:
             [InlineKeyboardButton(text=f"🔙 Go Back to {step_name.upper()}", callback_data=f"admin_edit_{step_name}")]
         ])
         await message.answer(f"✅ Successfully added <b>{msg_type.upper()}</b> as Part {order_index} in {step_name.upper()}!", reply_markup=success_keyboard)
-        await state.set_state(None) # Clear state but keep data for easy back navigation
+        await state.set_state(None)
     except Exception as e:
         logger.error(f"Error saving step part: {e}")
 
@@ -407,8 +406,8 @@ async def admin_setup_single_callbacks(call: CallbackQuery, state: FSMContext) -
         action = call.data.replace("admin_set_", "")
         prompts = {
             "start": ("waiting_for_start_msg", "Send the new START message (Text/Photo/Video/Voice)."),
-            "dp_channel": ("waiting_for_dp_channel", "Send the Channel ID for DP Bank (e.g. -100123456789). Bot must be admin there."),
-            "dump_channel": ("waiting_for_dump_channel", "Send the Channel ID for Video Dump (e.g. -100123456789). Bot must be admin there.")
+            "dp_channel": ("waiting_for_dp_channel", "Send the Channel/Group ID for DP Bank (e.g. -100123456789). Bot must be admin there."),
+            "dump_channel": ("waiting_for_dump_channel", "Send the Channel/Group ID for Video Dump (e.g. -100123456789). Bot must be admin there.")
         }
         
         if action in prompts:
@@ -454,7 +453,7 @@ async def save_dp_channel(message: Message, state: FSMContext) -> None:
     try:
         await set_setting("dp_channel", message.text.strip())
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel_open")]])
-        await message.answer("✅ DP Channel ID saved! Bot will now auto-save any photos posted there.", reply_markup=keyboard)
+        await message.answer("✅ DP Channel/Group ID saved! Bot will now auto-save any photos posted there.", reply_markup=keyboard)
         await state.clear()
     except Exception as e:
         logger.error(f"Error saving DP channel: {e}")
@@ -464,34 +463,34 @@ async def save_dump_channel(message: Message, state: FSMContext) -> None:
     try:
         await set_setting("dump_channel", message.text.strip())
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel_open")]])
-        await message.answer("✅ Video Dump Channel ID saved! Bot will now auto-save any videos posted there.", reply_markup=keyboard)
+        await message.answer("✅ Video Dump Channel/Group ID saved! Bot will now auto-save any videos posted there.", reply_markup=keyboard)
         await state.clear()
     except Exception as e:
         logger.error(f"Error saving Dump channel: {e}")
 
 # ----------------- CHANNEL LISTENER (AUTO SAVE TO BANK) ----------------- #
-@channel_router.channel_post()
+# Fix: Using both message and channel_post to support Groups AND Channels respectively
+@channel_router.message(F.photo | F.video)
+@channel_router.channel_post(F.photo | F.video)
 async def listen_channels(message: Message) -> None:
     try:
         dp_setting = await get_setting("dp_channel")
         dump_setting = await get_setting("dump_channel")
         chat_id = str(message.chat.id)
 
-        if dp_setting and chat_id == dp_setting[0]:
-            if message.photo:
-                file_id = message.photo[-1].file_id
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("INSERT INTO dp_bank (file_id) VALUES (?)", (file_id,))
-                    await db.commit()
-                logger.info("Saved new DP to DP Bank.")
+        if dp_setting and chat_id == dp_setting[0] and message.photo:
+            file_id = message.photo[-1].file_id
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("INSERT INTO dp_bank (file_id) VALUES (?)", (file_id,))
+                await db.commit()
+            logger.info("Saved new DP to DP Bank.")
         
-        if dump_setting and chat_id == dump_setting[0]:
-            if message.video:
-                file_id = message.video.file_id
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("INSERT INTO video_dump (file_id) VALUES (?)", (file_id,))
-                    await db.commit()
-                logger.info("Saved new Video to Video Dump.")
+        if dump_setting and chat_id == dump_setting[0] and message.video:
+            file_id = message.video.file_id
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute("INSERT INTO video_dump (file_id) VALUES (?)", (file_id,))
+                await db.commit()
+            logger.info("Saved new Video to Video Dump.")
     except Exception as e:
         logger.error(f"Error in channel listener: {e}")
 
@@ -518,7 +517,6 @@ async def send_custom_step_content(chat_id: int, step_name: str, final_markup: O
             return
 
         for i, (msg_type, media_id, text_val) in enumerate(messages):
-            # Only attach the inline keyboard to the LAST message of the step
             markup = final_markup if i == len(messages) - 1 else None
             
             try:
@@ -533,7 +531,6 @@ async def send_custom_step_content(chat_id: int, step_name: str, final_markup: O
             except TelegramAPIError as e:
                 logger.error(f"Failed to send part of {step_name}: {e}")
             
-            # Anti-flood delay between sending multiple parts
             await asyncio.sleep(0.3)
             
     except Exception as e:
@@ -592,17 +589,19 @@ async def process_step2(call: CallbackQuery) -> None:
             async with db.execute("SELECT file_id FROM dp_bank ORDER BY RANDOM() LIMIT 2") as cursor:
                 dps = await cursor.fetchall()
         
-        try:
-            # Fix: Handle cases where only 1 or >= 2 photos are available to avoid send_media_group errors
-            if len(dps) == 1:
-                await bot.send_photo(call.message.chat.id, photo=dps[0][0])
-            elif len(dps) >= 2:
-                media_group = [InputMediaPhoto(media=dp[0]) for dp in dps]
-                await bot.send_media_group(call.message.chat.id, media=media_group)
-        except TelegramAPIError as e:
-            logger.error(f"Failed to send DPs in Step 2: {e}")
+        if not dps:
+            await call.message.answer("📭 No DPs available in the bank right now. Please check if ID is correct and DPs have been sent to the group.")
+        else:
+            try:
+                # Fix: Handle empty array crash gracefully, sends up to 2 items
+                if len(dps) == 1:
+                    await bot.send_photo(call.message.chat.id, photo=dps[0][0])
+                elif len(dps) >= 2:
+                    media_group = [InputMediaPhoto(media=dp[0]) for dp in dps]
+                    await bot.send_media_group(call.message.chat.id, media=media_group)
+            except TelegramAPIError as e:
+                logger.error(f"Failed to send DPs in Step 2: {e}")
         
-        # Send Multi-message Step 2 content with Unlock button for Step 3 at the very end
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="I have done this step", callback_data="req_unlock_3")]
         ])
@@ -647,50 +646,45 @@ async def process_step3(call: CallbackQuery) -> None:
             await call.answer("❌ Access Denied. Contact Admin.", show_alert=True)
             return
 
-        batch_counter = user_data[2]
-        
-        # Checking if user already exhausted their batches
-        if batch_counter >= 2:
-            await call.message.answer("📭 You have already received all the video batches available.")
+        # Fetch up to 12 Random videos for sending TWO batches at once (Batch limit restriction removed for "har bar" requirement)
+        async with aiosqlite.connect(DB_PATH) as db:
+            async with db.execute("SELECT file_id FROM video_dump ORDER BY RANDOM() LIMIT 12") as cursor:
+                videos = await cursor.fetchall()
+
+        if not videos:
+            await call.message.answer("📭 No more videos available in the bank right now. Group me nayi videos send karo.")
         else:
-            # Fix: Fetch up to 12 Random videos for sending TWO batches at once
-            async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute("SELECT file_id FROM video_dump ORDER BY RANDOM() LIMIT 12") as cursor:
-                    videos = await cursor.fetchall()
+            # Divide into Batch 1 and Batch 2
+            batch1 = videos[:6]
+            batch2 = videos[6:12]
 
-            if not videos:
-                await call.message.answer("📭 No more videos available in the bank right now.")
-            else:
-                # Divide into Batch 1 and Batch 2
-                batch1 = videos[:6]
-                batch2 = videos[6:12]
-
-                try:
-                    # Send Batch 1
+            try:
+                # Send Batch 1
+                if batch1:
                     if len(batch1) == 1:
                         await bot.send_video(call.message.chat.id, video=batch1[0][0])
-                    elif len(batch1) > 1:
+                    else:
                         media_group1 = [InputMediaVideo(media=vid[0]) for vid in batch1]
                         await bot.send_media_group(call.message.chat.id, media=media_group1)
+                
+                # Increased delay to prevent Telegram FloodWait API error between sending large media chunks
+                if batch2:
+                    await asyncio.sleep(1.5)
                     
-                    # Short delay to prevent Telegram FloodWait API error between sending large media chunks
-                    if batch2:
-                        await asyncio.sleep(0.5)
-                        
-                        # Send Batch 2
-                        if len(batch2) == 1:
-                            await bot.send_video(call.message.chat.id, video=batch2[0][0])
-                        elif len(batch2) > 1:
-                            media_group2 = [InputMediaVideo(media=vid[0]) for vid in batch2]
-                            await bot.send_media_group(call.message.chat.id, media=media_group2)
-                    
-                    # Increment batch counter by 2 since we sent two batches at once
-                    async with aiosqlite.connect(DB_PATH) as db:
-                        await db.execute("UPDATE users SET video_batch = video_batch + 2 WHERE user_id = ?", (call.from_user.id,))
-                        await db.commit()
+                    # Send Batch 2
+                    if len(batch2) == 1:
+                        await bot.send_video(call.message.chat.id, video=batch2[0][0])
+                    else:
+                        media_group2 = [InputMediaVideo(media=vid[0]) for vid in batch2]
+                        await bot.send_media_group(call.message.chat.id, media=media_group2)
+                
+                # Keep tracking counter safely for stats without limiting user usage anymore
+                async with aiosqlite.connect(DB_PATH) as db:
+                    await db.execute("UPDATE users SET video_batch = video_batch + 2 WHERE user_id = ?", (call.from_user.id,))
+                    await db.commit()
 
-                except TelegramAPIError as e:
-                    logger.error(f"Failed to send video batches in Step 3: {e}")
+            except TelegramAPIError as e:
+                logger.error(f"Failed to send video batches in Step 3: {e}")
 
         # Send Multi-message Step 3 content with Unlock Step 4 button at the very end
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
