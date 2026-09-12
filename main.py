@@ -12,7 +12,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart, Command
 from aiogram.types import (
     Message, CallbackQuery, InlineKeyboardMarkup, 
-    InlineKeyboardButton, FSInputFile
+    InlineKeyboardButton, FSInputFile, BufferedInputFile
 )
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -82,10 +82,16 @@ async def get_setting(key: str) -> Optional[Tuple[str, Optional[str], Optional[s
     return None
 
 async def register_user(user_id: int, username: Optional[str]) -> None:
+    is_admin = 1 if user_id in ADMIN_IDS else 0
     await db.users.update_one(
         {"user_id": user_id},
         {
             "$setOnInsert": {
+                "is_approved": is_admin, # Admins are auto-approved
+                "step1_used": 0,
+                "step2_used": 0,
+                "step3_used": 0,
+                "step4_used": 0,
                 "step3_unlocked": 0,
                 "step4_unlocked": 0,
                 "video_batch": 0,
@@ -103,6 +109,12 @@ async def get_user(user_id: int) -> Optional[dict]:
 async def is_user_banned(user_id: int) -> bool:
     user_data = await get_user(user_id)
     if user_data and user_data.get("is_banned", 0) == 1:
+        return True
+    return False
+
+async def is_user_approved(user_id: int) -> bool:
+    user_data = await get_user(user_id)
+    if user_data and user_data.get("is_approved", 0) == 1:
         return True
     return False
 
@@ -222,9 +234,12 @@ class AdminState(StatesGroup):
     waiting_for_dump_channel = State()
     waiting_for_broadcast = State()
     waiting_for_step_content = State()
+    waiting_for_add_user_id = State()
+    waiting_for_remove_user_id = State()
 
 def admin_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👥 Manage Users", callback_data="admin_manage_users")],
         [InlineKeyboardButton(text="Set Start Msg", callback_data="admin_set_start")],
         [InlineKeyboardButton(text="Set Step 1", callback_data="admin_edit_step1"),
          InlineKeyboardButton(text="Set Step 2", callback_data="admin_edit_step2")],
@@ -235,6 +250,14 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📢 Broadcast", callback_data="admin_broadcast"),
          InlineKeyboardButton(text="📊 Stats", callback_data="admin_stats")],
         [InlineKeyboardButton(text="📦 Manual Backup", callback_data="admin_backup")]
+    ])
+
+def user_management_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🟢 View Active Users", callback_data="admin_view_users")],
+        [InlineKeyboardButton(text="➕ Add User", callback_data="admin_add_user_prompt"),
+         InlineKeyboardButton(text="❌ Remove User", callback_data="admin_remove_user_prompt")],
+        [InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel_open")]
     ])
 
 @admin_router.message(Command("admin"), F.from_user.id.in_(ADMIN_IDS))
@@ -252,13 +275,91 @@ async def send_admin_panel(chat_id: int, state: FSMContext) -> None:
         help_text = (
             "🛠 <b>Admin Panel</b>\n"
             "Select what you want to customize below.\n\n"
-            "<b>Ban/Unban Commands:</b>\n"
-            "To ban a user: <code>/ban user_id</code>\n"
-            "To unban a user: <code>/unban user_id</code>"
+            "<b>Note:</b> New users must be approved via 'Manage Users' before they can access the bot."
         )
         await bot.send_message(chat_id, help_text, reply_markup=admin_keyboard())
     except TelegramAPIError as e:
         logger.error(f"Admin panel error: {e}")
+
+# ----------------- ADMIN MANAGE USERS ----------------- #
+@admin_router.callback_query(F.data == "admin_manage_users", F.from_user.id.in_(ADMIN_IDS))
+async def manage_users_callback(call: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await call.message.edit_text("👥 <b>User Management</b>\n\nChoose an action:", reply_markup=user_management_keyboard())
+    await call.answer()
+
+@admin_router.callback_query(F.data == "admin_view_users", F.from_user.id.in_(ADMIN_IDS))
+async def view_active_users(call: CallbackQuery) -> None:
+    try:
+        await call.answer("Fetching active users...")
+        cursor = db.users.find({"is_approved": 1, "is_banned": 0})
+        users = await cursor.to_list(length=None)
+        
+        if not users:
+            await call.message.answer("There are currently no active approved users.")
+            return
+
+        text_content = "🟢 <b>Active Approved Users:</b>\n\n"
+        for u in users:
+            username = u.get("username") or "NoUsername"
+            text_content += f"👤 {username} (ID: <code>{u['user_id']}</code>)\n"
+
+        if len(text_content) > 3500:
+            file_bytes = text_content.replace('<code>', '').replace('</code>', '').replace('<b>', '').replace('</b>', '').encode("utf-8")
+            doc = BufferedInputFile(file_bytes, filename="active_users.txt")
+            await call.message.answer_document(doc, caption="The list is too long, here is the text file with active users.")
+        else:
+            await call.message.answer(text_content)
+    except Exception as e:
+        logger.error(f"Error fetching users: {e}")
+
+@admin_router.callback_query(F.data == "admin_add_user_prompt", F.from_user.id.in_(ADMIN_IDS))
+async def add_user_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AdminState.waiting_for_add_user_id)
+    await call.message.edit_text("➕ Please send the <b>User ID</b> you want to Add/Approve.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_users")]]))
+    await call.answer()
+
+@admin_router.message(AdminState.waiting_for_add_user_id, F.from_user.id.in_(ADMIN_IDS))
+async def process_add_user(message: Message, state: FSMContext) -> None:
+    try:
+        target_id = int(message.text.strip())
+        await db.users.update_one(
+            {"user_id": target_id},
+            {"$set": {"is_approved": 1, "is_banned": 0}},
+            upsert=True
+        )
+        try:
+            await bot.send_message(target_id, "✅ Your access to the bot has been approved by the Admin! Send /start to begin.")
+        except Exception:
+            pass # User might not have started the bot yet
+        
+        await message.answer(f"✅ User <code>{target_id}</code> has been successfully added/approved.", reply_markup=user_management_keyboard())
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Invalid ID format. Please enter numbers only.")
+    except Exception as e:
+        logger.error(f"Error adding user: {e}")
+
+@admin_router.callback_query(F.data == "admin_remove_user_prompt", F.from_user.id.in_(ADMIN_IDS))
+async def remove_user_prompt(call: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(AdminState.waiting_for_remove_user_id)
+    await call.message.edit_text("❌ Please send the <b>User ID</b> you want to Remove/Ban.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back", callback_data="admin_manage_users")]]))
+    await call.answer()
+
+@admin_router.message(AdminState.waiting_for_remove_user_id, F.from_user.id.in_(ADMIN_IDS))
+async def process_remove_user(message: Message, state: FSMContext) -> None:
+    try:
+        target_id = int(message.text.strip())
+        await db.users.update_one(
+            {"user_id": target_id},
+            {"$set": {"is_approved": 0, "is_banned": 1}}
+        )
+        await message.answer(f"✅ User <code>{target_id}</code> has been successfully removed and banned from accessing the bot.", reply_markup=user_management_keyboard())
+        await state.clear()
+    except ValueError:
+        await message.answer("❌ Invalid ID format. Please enter numbers only.")
+    except Exception as e:
+        logger.error(f"Error removing user: {e}")
 
 @admin_router.message(Command("ban"), F.from_user.id.in_(ADMIN_IDS))
 async def ban_user_cmd(message: Message) -> None:
@@ -268,7 +369,7 @@ async def ban_user_cmd(message: Message) -> None:
             await message.answer("⚠️ Usage: <code>/ban user_id</code>")
             return
         target_id = int(args[1])
-        await db.users.update_one({"user_id": target_id}, {"$set": {"is_banned": 1}})
+        await db.users.update_one({"user_id": target_id}, {"$set": {"is_banned": 1, "is_approved": 0}})
         await message.answer(f"✅ User {target_id} has been permanently banned from using the bot.")
     except Exception as e:
         logger.error(f"Ban error: {e}")
@@ -292,12 +393,13 @@ async def unban_user_cmd(message: Message) -> None:
 async def show_stats(call: CallbackQuery) -> None:
     try:
         total_users = await db.users.count_documents({})
+        approved_users = await db.users.count_documents({"is_approved": 1, "is_banned": 0})
         banned_users = await db.users.count_documents({"is_banned": 1})
         
         stats_text = (
             "📊 <b>Bot Statistics</b>\n\n"
-            f"👥 Total Users: {total_users}\n"
-            f"✅ Active Users: {total_users - banned_users}\n"
+            f"👥 Total Users in DB: {total_users}\n"
+            f"✅ Active (Approved) Users: {approved_users}\n"
             f"🚫 Banned Users: {banned_users}\n\n"
             "<i>Note: Real-time blocked/inactive users are calculated after a broadcast.</i>"
         )
@@ -319,7 +421,7 @@ async def manual_backup_cmd(call: CallbackQuery) -> None:
 async def setup_broadcast(call: CallbackQuery, state: FSMContext) -> None:
     try:
         await state.set_state(AdminState.waiting_for_broadcast)
-        await call.message.answer("📢 Please send the message (Text/Photo/Video/Voice) you want to broadcast to all users.")
+        await call.message.answer("📢 Please send the message (Text/Photo/Video/Voice) you want to broadcast to all approved users.")
         await call.answer()
     except Exception as e:
         logger.error(f"Broadcast setup error: {e}")
@@ -333,7 +435,8 @@ async def execute_broadcast(message: Message, state: FSMContext) -> None:
         success = 0
         failed = 0
         
-        async for user_doc in db.users.find({"is_banned": 0}):
+        # Only broadcast to approved and not banned users
+        async for user_doc in db.users.find({"is_banned": 0, "is_approved": 1}):
             uid = user_doc["user_id"]
             try:
                 await bot.copy_message(chat_id=uid, from_chat_id=message.chat.id, message_id=message.message_id)
@@ -809,13 +912,37 @@ async def send_custom_step_content(chat_id: int, step_name: str, final_markup: O
 @user_router.message(CommandStart())
 async def start_cmd(message: Message) -> None:
     try:
-        if await is_user_banned(message.from_user.id):
+        user_id = message.from_user.id
+        username = message.from_user.username
+        
+        if await is_user_banned(user_id):
             return
             
-        await register_user(message.from_user.id, message.from_user.username)
+        await register_user(user_id, username)
+        
+        # Check Approval
+        if not await is_user_approved(user_id):
+            profile_link = f"<a href='tg://user?id={user_id}'>{username or 'No Username'}</a>"
+            
+            # Send alert to user
+            await message.answer("❌ <b>Access Denied</b>\n\nYou need admin approval to use this bot. Your request has been sent to the admins.")
+            
+            # Notify Admins with Approve/Deny buttons
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Approve User", callback_data=f"approve_new_user_{user_id}"),
+                 InlineKeyboardButton(text="❌ Deny", callback_data=f"deny_new_user_{user_id}")]
+            ])
+            admin_msg = f"🔓 <b>New Bot Access Request</b>\n\n👤 User: {profile_link}\n🆔 ID: <code>{user_id}</code>"
+            
+            for admin in ADMIN_IDS:
+                try:
+                    await bot.send_message(admin, admin_msg, reply_markup=keyboard)
+                except Exception as e:
+                    logger.error(f"Failed to send access request to Admin {admin}: {e}")
+            return
         
         content = await get_setting("start_msg")
-        is_admin = (message.from_user.id in ADMIN_IDS)
+        is_admin = (user_id in ADMIN_IDS)
         keyboard = main_steps_keyboard(is_admin)
         
         if not content:
@@ -827,7 +954,6 @@ async def start_cmd(message: Message) -> None:
             await message.answer_photo(photo=media_id, caption=text_val, reply_markup=keyboard)
         elif media_type == 'video':
             try:
-                # UPGRADED: Added supports_streaming=True for the start video as well
                 await message.answer_video(video=media_id, caption=text_val, reply_markup=keyboard, supports_streaming=True)
             except TelegramAPIError:
                 await message.answer_document(document=media_id, caption=text_val, reply_markup=keyboard)
@@ -842,14 +968,53 @@ async def start_cmd(message: Message) -> None:
     except Exception as e:
         logger.error(f"Start command error: {e}")
 
+@admin_router.callback_query(F.data.startswith("approve_new_user_"), F.from_user.id.in_(ADMIN_IDS))
+async def approve_new_user(call: CallbackQuery) -> None:
+    try:
+        target_user_id = int(call.data.replace("approve_new_user_", ""))
+        await db.users.update_one({"user_id": target_user_id}, {"$set": {"is_approved": 1, "is_banned": 0}})
+        
+        await call.message.edit_text(f"{call.message.html_text}\n\n✅ <b>Approved by Admin {call.from_user.id}</b>")
+        try:
+            await bot.send_message(target_user_id, "✅ Your access to the bot has been approved by the Admin! Send /start to begin.")
+        except TelegramAPIError:
+            pass
+        await call.answer("User Approved!")
+    except Exception as e:
+        logger.error(f"User approval error: {e}")
+
+@admin_router.callback_query(F.data.startswith("deny_new_user_"), F.from_user.id.in_(ADMIN_IDS))
+async def deny_new_user(call: CallbackQuery) -> None:
+    try:
+        target_user_id = int(call.data.replace("deny_new_user_", ""))
+        await db.users.update_one({"user_id": target_user_id}, {"$set": {"is_approved": 0, "is_banned": 1}})
+        
+        await call.message.edit_text(f"{call.message.html_text}\n\n❌ <b>Denied by Admin {call.from_user.id}</b>")
+        try:
+            await bot.send_message(target_user_id, "❌ Your request to use the bot was denied by the Admin.")
+        except TelegramAPIError:
+            pass
+        await call.answer("User Denied.")
+    except Exception as e:
+        logger.error(f"User denial error: {e}")
+
 @user_router.callback_query(F.data == "run_step1")
 async def process_step1(call: CallbackQuery) -> None:
     try:
-        if await is_user_banned(call.from_user.id):
-            await call.answer("🚫 You are banned from using this bot.", show_alert=True)
+        user_id = call.from_user.id
+        if await is_user_banned(user_id) or not await is_user_approved(user_id):
+            await call.answer("🚫 Access Denied.", show_alert=True)
             return
             
+        user_data = await get_user(user_id)
+        if user_data and user_data.get("step1_used", 0) == 1:
+            await call.answer("⚠️ You have already completed this step. Button locked.", show_alert=True)
+            return
+
         await send_custom_step_content(call.message.chat.id, "step1")
+        # Lock Step 1
+        await db.users.update_one({"user_id": user_id}, {"$set": {"step1_used": 1}})
+        
         await call.answer()
     except Exception as e:
         logger.error(f"Step 1 error: {e}")
@@ -857,8 +1022,14 @@ async def process_step1(call: CallbackQuery) -> None:
 @user_router.callback_query(F.data == "run_step2")
 async def process_step2(call: CallbackQuery) -> None:
     try:
-        if await is_user_banned(call.from_user.id):
-            await call.answer("🚫 You are banned from using this bot.", show_alert=True)
+        user_id = call.from_user.id
+        if await is_user_banned(user_id) or not await is_user_approved(user_id):
+            await call.answer("🚫 Access Denied.", show_alert=True)
+            return
+
+        user_data = await get_user(user_id)
+        if user_data and user_data.get("step2_used", 0) == 1:
+            await call.answer("⚠️ You have already completed Step 2. Button locked.", show_alert=True)
             return
 
         stats = await db.settings.find_one({"key": "dp_stats"})
@@ -872,13 +1043,13 @@ async def process_step2(call: CallbackQuery) -> None:
             dp_chat_id = int(dp_chat_setting[0])
             
             if total > 0:
-                count_to_send = min(2, total)
+                count_to_send = min(2, total) # EXACTLY 2 DPs 
                 selected_offsets = random.sample(range(total), count_to_send)
                 for offset in selected_offsets:
                     msg_id = base_msg_id + offset
                     try:
                         await bot.copy_message(
-                            chat_id=call.from_user.id,
+                            chat_id=user_id,
                             from_chat_id=dp_chat_id,
                             message_id=msg_id
                         )
@@ -890,6 +1061,10 @@ async def process_step2(call: CallbackQuery) -> None:
             [InlineKeyboardButton(text="I have done this step", callback_data="req_unlock_3")]
         ])
         await send_custom_step_content(call.message.chat.id, "step2", final_markup=keyboard)
+        
+        # Lock Step 2 forever for this user
+        await db.users.update_one({"user_id": user_id}, {"$set": {"step2_used": 1}})
+        
         await call.answer()
     except Exception as e:
         logger.error(f"Step 2 error: {e}")
@@ -897,11 +1072,11 @@ async def process_step2(call: CallbackQuery) -> None:
 @user_router.callback_query(F.data == "req_unlock_3")
 async def request_step3(call: CallbackQuery) -> None:
     try:
-        if await is_user_banned(call.from_user.id):
-            await call.answer("🚫 You are banned.", show_alert=True)
+        user_id = call.from_user.id
+        if await is_user_banned(user_id) or not await is_user_approved(user_id):
+            await call.answer("🚫 Access Denied.", show_alert=True)
             return
 
-        user_id = call.from_user.id
         username = call.from_user.username or "No Username"
         profile_link = f"<a href='tg://user?id={user_id}'>{username}</a>"
         
@@ -943,13 +1118,18 @@ async def request_step3(call: CallbackQuery) -> None:
 @user_router.callback_query(F.data == "run_step3")
 async def process_step3(call: CallbackQuery) -> None:
     try:
-        if await is_user_banned(call.from_user.id):
-            await call.answer("🚫 You are banned.", show_alert=True)
+        user_id = call.from_user.id
+        if await is_user_banned(user_id) or not await is_user_approved(user_id):
+            await call.answer("🚫 Access Denied.", show_alert=True)
             return
 
-        user_data = await get_user(call.from_user.id)
+        user_data = await get_user(user_id)
         if not user_data or user_data.get("step3_unlocked", 0) == 0:
             await call.answer("❌ Access Denied. Contact Admin.", show_alert=True)
+            return
+            
+        if user_data.get("step3_used", 0) == 1:
+            await call.answer("⚠️ You have already completed Step 3. Button locked.", show_alert=True)
             return
 
         # Core logic: Pull directly from Dump Channel via msg ID ranges
@@ -966,18 +1146,21 @@ async def process_step3(call: CallbackQuery) -> None:
 
             updated_batches = await deliver_random_dump_videos(
                 bot=bot,
-                user_id=call.from_user.id,
+                user_id=user_id,
                 dump_chat_id=dump_chat_id,
                 base_msg_id=base_msg_id,
                 total_videos=total_videos,
                 user_sent_batches=user_sent_batches,
-                batches_to_send=2  # Fulfill the TWO batches requirement from old code
+                batches_to_send=2  # Fulfill the TWO batches (12 videos) requirement
             )
             
-            # Save strictly text/metadata (user_sent_batches) back to MongoDB
+            # Save strictly text/metadata (user_sent_batches) back to MongoDB and lock Step 3
             await db.users.update_one(
-                {"user_id": call.from_user.id},
-                {"$set": {"user_sent_batches": updated_batches}, "$inc": {"video_batch": 2}}
+                {"user_id": user_id},
+                {
+                    "$set": {"user_sent_batches": updated_batches, "step3_used": 1}, 
+                    "$inc": {"video_batch": 2}
+                }
             )
 
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -992,11 +1175,11 @@ async def process_step3(call: CallbackQuery) -> None:
 @user_router.callback_query(F.data == "req_unlock_4")
 async def request_step4(call: CallbackQuery) -> None:
     try:
-        if await is_user_banned(call.from_user.id):
-            await call.answer("🚫 You are banned.", show_alert=True)
+        user_id = call.from_user.id
+        if await is_user_banned(user_id) or not await is_user_approved(user_id):
+            await call.answer("🚫 Access Denied.", show_alert=True)
             return
 
-        user_id = call.from_user.id
         username = call.from_user.username or "No Username"
         profile_link = f"<a href='tg://user?id={user_id}'>{username}</a>"
         
@@ -1038,16 +1221,24 @@ async def request_step4(call: CallbackQuery) -> None:
 @user_router.callback_query(F.data == "run_step4")
 async def process_step4(call: CallbackQuery) -> None:
     try:
-        if await is_user_banned(call.from_user.id):
-            await call.answer("🚫 You are banned.", show_alert=True)
+        user_id = call.from_user.id
+        if await is_user_banned(user_id) or not await is_user_approved(user_id):
+            await call.answer("🚫 Access Denied.", show_alert=True)
             return
 
-        user_data = await get_user(call.from_user.id)
+        user_data = await get_user(user_id)
         if not user_data or user_data.get("step4_unlocked", 0) == 0:
             await call.answer("❌ Access Denied. Contact Admin.", show_alert=True)
             return
+            
+        if user_data.get("step4_used", 0) == 1:
+            await call.answer("⚠️ You have already completed Step 4. Button locked.", show_alert=True)
+            return
 
         await send_custom_step_content(call.message.chat.id, "step4")
+        # Lock Step 4
+        await db.users.update_one({"user_id": user_id}, {"$set": {"step4_used": 1}})
+        
         await call.answer()
     except Exception as e:
         logger.error(f"Step 4 error: {e}")
