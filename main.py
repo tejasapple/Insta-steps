@@ -446,7 +446,8 @@ async def save_media_setting(message: Message, state: FSMContext, key_name: str)
         await message.answer("❌ Error saving setting.")
 
 @admin_router.message(AdminState.waiting_for_start_msg, F.from_user.id == ADMIN_ID)
-async def save_start(msg: Message, state: FSMContext) -> None: await save_media_setting(msg, state, "start_msg")
+async def save_start(msg: Message, state: FSMContext) -> None: 
+    await save_media_setting(msg, state, "start_msg")
 
 @admin_router.message(AdminState.waiting_for_dp_channel, F.from_user.id == ADMIN_ID)
 async def save_dp_channel(message: Message, state: FSMContext) -> None:
@@ -591,9 +592,15 @@ async def process_step2(call: CallbackQuery) -> None:
             async with db.execute("SELECT file_id FROM dp_bank ORDER BY RANDOM() LIMIT 2") as cursor:
                 dps = await cursor.fetchall()
         
-        if len(dps) > 0:
-            media_group = [InputMediaPhoto(media=dp[0]) for dp in dps]
-            await bot.send_media_group(call.message.chat.id, media=media_group)
+        try:
+            # Fix: Handle cases where only 1 or >= 2 photos are available to avoid send_media_group errors
+            if len(dps) == 1:
+                await bot.send_photo(call.message.chat.id, photo=dps[0][0])
+            elif len(dps) >= 2:
+                media_group = [InputMediaPhoto(media=dp[0]) for dp in dps]
+                await bot.send_media_group(call.message.chat.id, media=media_group)
+        except TelegramAPIError as e:
+            logger.error(f"Failed to send DPs in Step 2: {e}")
         
         # Send Multi-message Step 2 content with Unlock button for Step 3 at the very end
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
@@ -642,25 +649,48 @@ async def process_step3(call: CallbackQuery) -> None:
 
         batch_counter = user_data[2]
         
-        # User only gets 2 batches of 6 videos. Total 12 max.
+        # Checking if user already exhausted their batches
         if batch_counter >= 2:
             await call.message.answer("📭 You have already received all the video batches available.")
         else:
-            # Fetch 6 Random videos for this batch
+            # Fix: Fetch up to 12 Random videos for sending TWO batches at once
             async with aiosqlite.connect(DB_PATH) as db:
-                async with db.execute("SELECT file_id FROM video_dump ORDER BY RANDOM() LIMIT 6") as cursor:
+                async with db.execute("SELECT file_id FROM video_dump ORDER BY RANDOM() LIMIT 12") as cursor:
                     videos = await cursor.fetchall()
 
             if not videos:
                 await call.message.answer("📭 No more videos available in the bank right now.")
             else:
-                media_group = [InputMediaVideo(media=vid[0]) for vid in videos]
-                await bot.send_media_group(call.message.chat.id, media=media_group)
-                
-                # Increment batch counter
-                async with aiosqlite.connect(DB_PATH) as db:
-                    await db.execute("UPDATE users SET video_batch = video_batch + 1 WHERE user_id = ?", (call.from_user.id,))
-                    await db.commit()
+                # Divide into Batch 1 and Batch 2
+                batch1 = videos[:6]
+                batch2 = videos[6:12]
+
+                try:
+                    # Send Batch 1
+                    if len(batch1) == 1:
+                        await bot.send_video(call.message.chat.id, video=batch1[0][0])
+                    elif len(batch1) > 1:
+                        media_group1 = [InputMediaVideo(media=vid[0]) for vid in batch1]
+                        await bot.send_media_group(call.message.chat.id, media=media_group1)
+                    
+                    # Short delay to prevent Telegram FloodWait API error between sending large media chunks
+                    if batch2:
+                        await asyncio.sleep(0.5)
+                        
+                        # Send Batch 2
+                        if len(batch2) == 1:
+                            await bot.send_video(call.message.chat.id, video=batch2[0][0])
+                        elif len(batch2) > 1:
+                            media_group2 = [InputMediaVideo(media=vid[0]) for vid in batch2]
+                            await bot.send_media_group(call.message.chat.id, media=media_group2)
+                    
+                    # Increment batch counter by 2 since we sent two batches at once
+                    async with aiosqlite.connect(DB_PATH) as db:
+                        await db.execute("UPDATE users SET video_batch = video_batch + 2 WHERE user_id = ?", (call.from_user.id,))
+                        await db.commit()
+
+                except TelegramAPIError as e:
+                    logger.error(f"Failed to send video batches in Step 3: {e}")
 
         # Send Multi-message Step 3 content with Unlock Step 4 button at the very end
         keyboard = InlineKeyboardMarkup(inline_keyboard=[
