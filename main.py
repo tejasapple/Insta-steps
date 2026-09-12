@@ -1,4 +1,5 @@
 import os
+import re
 import asyncio
 import logging
 import random
@@ -396,15 +397,96 @@ async def clear_step_parts(call: CallbackQuery, state: FSMContext) -> None:
     except Exception as e:
         logger.error(f"Error clearing step parts: {e}")
 
-# Admin Single Settings (Start Msg, Channels)
+# ----------------- MEDIA/CHANNEL EXTRACTOR UTILS ----------------- #
+async def extract_channel_info(message: Message) -> Tuple[Optional[str], Optional[int]]:
+    """Extracts chat_id and message_id from a forwarded message or raw channel link."""
+    chat_id = None
+    base_msg_id = None
+
+    if getattr(message, 'forward_origin', None):
+        origin = message.forward_origin
+        if origin.type == 'channel':
+            chat_id = str(origin.chat.id)
+            base_msg_id = origin.message_id
+        elif origin.type == 'chat':
+            chat_id = str(origin.sender_chat.id)
+            base_msg_id = origin.message_id
+    elif getattr(message, 'forward_from_chat', None):
+        chat_id = str(message.forward_from_chat.id)
+        base_msg_id = getattr(message, 'forward_from_message_id', 1)
+    elif message.text:
+        text = message.text.strip()
+        # Match private channel links: https://t.me/c/123456789/2
+        match_private = re.search(r't\.me/c/(\d+)/(\d+)', text)
+        if match_private:
+            chat_id = f"-100{match_private.group(1)}"
+            base_msg_id = int(match_private.group(2))
+        else:
+            # Match public channel links: https://t.me/channelname/2
+            match_public = re.search(r't\.me/([^/]+)/(\d+)', text)
+            if match_public:
+                chat_id = f"@{match_public.group(1)}"
+                base_msg_id = int(match_public.group(2))
+        
+        if not chat_id:
+            chat_id = text
+            base_msg_id = 1 
+            
+    return chat_id, base_msg_id
+
+async def get_channel_total_count(bot: Bot, chat_id: str, base_msg_id: int, admin_id: int) -> int:
+    """Dynamically probes the channel to calculate the total available messages."""
+    try:
+        highest_found = base_msg_id
+        step = 500
+        current = base_msg_id + step
+        
+        # Probe upwards to find the ceiling
+        for _ in range(20): # Safety limit to max 10,000 messages
+            success = False
+            for offset in range(3): # Allowance for deleted messages
+                try:
+                    msg = await bot.copy_message(chat_id=admin_id, from_chat_id=chat_id, message_id=current + offset, disable_notification=True)
+                    await bot.delete_message(chat_id=admin_id, message_id=msg.message_id)
+                    highest_found = current + offset
+                    success = True
+                    break
+                except TelegramAPIError:
+                    await asyncio.sleep(0.1)
+            
+            if success:
+                current += step
+            else:
+                break
+                
+        # Probe backwards to find the exact last valid ID
+        last_valid = highest_found
+        for check_id in range(highest_found + step, highest_found, -25):
+            if check_id <= highest_found:
+                break
+            try:
+                msg = await bot.copy_message(chat_id=admin_id, from_chat_id=chat_id, message_id=check_id, disable_notification=True)
+                await bot.delete_message(chat_id=admin_id, message_id=msg.message_id)
+                last_valid = check_id
+                break
+            except TelegramAPIError:
+                await asyncio.sleep(0.1)
+                
+        total = (last_valid - base_msg_id) + 1
+        return total if total > 0 else 500
+    except Exception as e:
+        logger.error(f"Error calculating total count: {e}")
+        return 500 # Fallback pool size
+
+# ----------------- ADMIN SINGLE SETTINGS ----------------- #
 @admin_router.callback_query(F.data.startswith("admin_set_"), F.from_user.id == ADMIN_ID)
 async def admin_setup_single_callbacks(call: CallbackQuery, state: FSMContext) -> None:
     try:
         action = call.data.replace("admin_set_", "")
         prompts = {
             "start": ("waiting_for_start_msg", "Send the new START message (Text/Photo/Video/Voice)."),
-            "dp_channel": ("waiting_for_dp_channel", "Send the Channel/Group ID for DP Bank (e.g. -100123456789). Bot must be admin there."),
-            "dump_channel": ("waiting_for_dump_channel", "Send the Channel/Group ID for Video Dump (e.g. -100123456789). Bot must be admin there.")
+            "dp_channel": ("waiting_for_dp_channel", "To accurately fetch DPs, please FORWARD the FIRST photo message from your DP Channel here.\n\n(Alternatively, send the raw message link like <code>https://t.me/c/123456789/2</code>)\n\n⚠️ Invite links will not work directly."),
+            "dump_channel": ("waiting_for_dump_channel", "To accurately fetch videos, please FORWARD the FIRST video message from your Dump Channel here.\n\n(Alternatively, send the raw message link like <code>https://t.me/c/123456789/2</code>)\n\n⚠️ Invite links will not work directly.")
         }
         
         if action in prompts:
@@ -448,24 +530,84 @@ async def save_start(msg: Message, state: FSMContext) -> None:
 @admin_router.message(AdminState.waiting_for_dp_channel, F.from_user.id == ADMIN_ID)
 async def save_dp_channel(message: Message, state: FSMContext) -> None:
     try:
-        await set_setting("dp_channel", message.text.strip())
-        await db.settings.delete_one({"key": "dp_stats"}) # Reset stats on new channel
+        chat_id, base_msg_id = await extract_channel_info(message)
+        if not chat_id:
+            await message.answer("❌ Could not extract Channel ID. Please forward a message or send a valid link.")
+            return
+
+        processing_msg = await message.answer("⏳ <i>Extracting channel data and calculating totals... Please wait.</i>")
+        
+        try:
+            await bot.get_chat(chat_id)
+        except TelegramAPIError:
+            await processing_msg.edit_text("❌ Bot cannot access this channel. Please ensure the bot is added as an Admin to the channel first!")
+            return
+
+        total_count = await get_channel_total_count(bot, chat_id, base_msg_id, ADMIN_ID)
+
+        await set_setting("dp_channel", chat_id)
+        
+        # Save base_msg_id and initialized total instead of deleting stats
+        await db.settings.update_one(
+            {"key": "dp_stats"},
+            {"$set": {"base_msg_id": base_msg_id, "total": total_count}},
+            upsert=True
+        )
+        
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel_open")]])
-        await message.answer("✅ DP Channel/Group ID saved! Forward DPs to track them without saving files to DB.", reply_markup=keyboard)
+        success_text = (
+            "✅ <b>DP Channel Configured Successfully!</b>\n\n"
+            f"🔗 <b>Chat ID:</b> <code>{chat_id}</code>\n"
+            f"📍 <b>Base Msg ID:</b> {base_msg_id}\n"
+            f"📊 <b>Total Auto-Fetched:</b> ~{total_count} media files\n\n"
+            "<i>Note: Any new DPs sent to the channel will be tracked automatically.</i>"
+        )
+        await processing_msg.edit_text(success_text, reply_markup=keyboard)
         await state.clear()
     except Exception as e:
         logger.error(f"Error saving DP channel: {e}")
+        await message.answer("❌ Error saving DP channel.")
 
 @admin_router.message(AdminState.waiting_for_dump_channel, F.from_user.id == ADMIN_ID)
 async def save_dump_channel(message: Message, state: FSMContext) -> None:
     try:
-        await set_setting("dump_channel", message.text.strip())
-        await db.settings.delete_one({"key": "video_stats"}) # Reset stats on new channel
+        chat_id, base_msg_id = await extract_channel_info(message)
+        if not chat_id:
+            await message.answer("❌ Could not extract Channel ID. Please forward a message or send a valid link.")
+            return
+
+        processing_msg = await message.answer("⏳ <i>Extracting channel data and calculating totals... Please wait.</i>")
+        
+        try:
+            await bot.get_chat(chat_id)
+        except TelegramAPIError:
+            await processing_msg.edit_text("❌ Bot cannot access this channel. Please ensure the bot is added as an Admin to the channel first!")
+            return
+
+        total_count = await get_channel_total_count(bot, chat_id, base_msg_id, ADMIN_ID)
+
+        await set_setting("dump_channel", chat_id)
+        
+        # Save base_msg_id and initialized total instead of deleting stats
+        await db.settings.update_one(
+            {"key": "video_stats"},
+            {"$set": {"base_msg_id": base_msg_id, "total": total_count}},
+            upsert=True
+        )
+        
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Back to Admin", callback_data="admin_panel_open")]])
-        await message.answer("✅ Video Dump Channel/Group ID saved! Forward videos to track them without saving files to DB.", reply_markup=keyboard)
+        success_text = (
+            "✅ <b>Video Dump Channel Configured Successfully!</b>\n\n"
+            f"🔗 <b>Chat ID:</b> <code>{chat_id}</code>\n"
+            f"📍 <b>Base Msg ID:</b> {base_msg_id}\n"
+            f"📊 <b>Total Auto-Fetched:</b> ~{total_count} media files\n\n"
+            "<i>Note: Any new videos sent to the channel will be tracked automatically.</i>"
+        )
+        await processing_msg.edit_text(success_text, reply_markup=keyboard)
         await state.clear()
     except Exception as e:
         logger.error(f"Error saving Dump channel: {e}")
+        await message.answer("❌ Error saving Dump channel.")
 
 # ----------------- CHANNEL LISTENER (AUTO TRACK METADATA ONLY) ----------------- #
 @channel_router.message(F.photo | F.video)
