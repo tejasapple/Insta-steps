@@ -1198,9 +1198,14 @@ async def process_step4(call: CallbackQuery) -> None:
 @admin_router.callback_query(F.data.startswith("approve_"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_approve_request(call: CallbackQuery) -> None:
     try:
-        parts = call.data.split('_')
-        step = parts[1]
-        target_user_id = int(parts[2])
+        # Robust parsing for old/corrupted callback data using regex
+        nums = re.findall(r'\d+', call.data)
+        if not nums:
+            await call.answer("❌ Error: Invalid button data.", show_alert=True)
+            return
+            
+        target_user_id = int(nums[-1])
+        step = nums[0] if len(nums) > 1 else "3"
 
         if step == "3":
             # Unlocking Step 3 and Step 4 simultaneously based on one approval!
@@ -1235,9 +1240,14 @@ async def admin_approve_request(call: CallbackQuery) -> None:
 @admin_router.callback_query(F.data.startswith("deny_"), F.from_user.id.in_(ADMIN_IDS))
 async def admin_deny_request(call: CallbackQuery) -> None:
     try:
-        parts = call.data.split('_')
-        step = parts[1]
-        target_user_id = int(parts[2])
+        # Robust parsing for old/corrupted callback data using regex
+        nums = re.findall(r'\d+', call.data)
+        if not nums:
+            await call.answer("❌ Error: Invalid button data.", show_alert=True)
+            return
+            
+        target_user_id = int(nums[-1])
+        step = nums[0] if len(nums) > 1 else "3"
 
         user_data = await get_user(target_user_id)
         pending_msgs = user_data.get(f"pending_step{step}_msgs", {})
